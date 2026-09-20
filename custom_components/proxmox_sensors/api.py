@@ -560,14 +560,25 @@ class ProxmoxClient:
     def _pbs_request(
         self, method: str, path: str, data=None, raise_errors: bool = False
     ):
-        port = self._port or 8007
-
-        clean_host = (
+        host_no_scheme = (
             self._host.replace("https://", "")
             .replace("http://", "")
             .split("/")[0]
-            .split(":")[0]
         )
+        clean_host = host_no_scheme.split(":")[0]
+        # A port embedded in the host string ("pbs.example.net:443") wins over the
+        # 8007 default, matching the PVE path where proxmoxer parses host:port
+        # itself. Without this a PBS entry cannot sit behind a reverse-proxy vhost
+        # on 443: the port is stripped and every request goes to :8007, while the
+        # integration's own error message still quotes the CONFIGURED host:port, so
+        # it reports a port it never actually contacted. An explicit self._port
+        # still takes precedence over both.
+        if self._port:
+            port = self._port
+        elif ":" in host_no_scheme and host_no_scheme.rsplit(":", 1)[-1].isdigit():
+            port = int(host_no_scheme.rsplit(":", 1)[-1])
+        else:
+            port = 8007
         url = f"https://{clean_host}:{port}/api2/json/{path}"
 
         if not self._user or not self._token_secret:
