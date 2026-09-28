@@ -25,7 +25,6 @@
           "token_id": "Token ID（不包含 user@pve!）",
           "token_secret": "Token Secret",
           "auto_detect_node": "从主机 IP 自动检测节点",
-          "enable_lm_sensors": "启用硬件传感器与温度监控",
           "enable_cluster": "启用集群级监控",
           "verify_ssl": "验证 SSL 证书"
         }
@@ -43,7 +42,7 @@
       },
       "credentials_cluster": {
         "title": "3. 访问凭据 — Proxmox 集群",
-        "description": "请输入用于连接集群的凭据。集群使用与 PVE 相同的 API（端口 8006）。",
+        "description": "输入 CLUSTER 凭据（PVE API，端口 8006）。如果存在无关联 CLUSTER 的 PVE 条目，可创建新关联或明确恢复现有关联。",
         "data": {
           "user": "用户（例如 root@pam）",
           "password": "密码",
@@ -52,11 +51,44 @@
           "verify_ssl": "验证 SSL 证书"
         }
       },
+      "cluster_association": {
+        "title": "CLUSTER 关联",
+        "description": "创建新关联，或恢复无关联 CLUSTER 的 PVE 条目所用关联。名称和主机地址不能用于推断成员关系。",
+        "menu_options": {
+          "new_cluster_association": "创建新关联",
+          "recover_cluster_scope": "恢复现有 PVE 条目的关联"
+        }
+      },
+      "recover_cluster_scope": {
+        "title": "无关联 CLUSTER 的 PVE 条目",
+        "description": "选择属于此物理 CLUSTER 的 PVE 组。Independent PVE 也可能出现在此处；继续前请核对所有成员。",
+        "data": {"scope": "PVE 组"}
+      },
+      "confirm_cluster_recovery": {
+        "title": "确认恢复 CLUSTER 关联",
+        "description": "请确认此物理 CLUSTER 包含以下所有 PVE：{pves}。将沿用它们现有的身份。",
+        "data": {"confirm": "恢复此关联"}
+      },
       "select_node": {
         "title": "4. 选择节点",
         "description": "请选择要监控的 Proxmox 节点。",
         "data": {
           "node": "节点"
+        }
+      },
+      "pve_membership": {
+        "title": "服务器归属",
+        "description": "选择将此服务器加入已配置的集群，或独立配置。仅列出可加入的集群。",
+        "menu_options": {
+          "join_cluster": "加入已配置的集群",
+          "independent": "配置独立服务器或集群"
+        }
+      },
+      "join_cluster": {
+        "title": "选择集群",
+        "description": "选择此服务器所属的集群。此选择决定哪些节点可以共享客户机实体。",
+        "data": {
+          "cluster": "集群"
         }
       },
       "select_resources": {
@@ -67,16 +99,21 @@
           "cts": "容器（LXC）",
           "storage": "存储",
           "enable_physical_disks": "启用物理磁盘监控",
+          "enable_lm_sensors": "启用硬件传感器与温度监控",
           "enable_node_controls": "启用节点电源控制"
         }
       }
     },
     "error": {
+      "recovery_unavailable": "PVE 组已变化，或其身份与 Registry 冲突。请重新选择；未创建 CLUSTER。",
+      "cluster_unavailable": "所选集群已无法加入。请返回或选择其他集群。",
       "cannot_connect": "连接错误。请检查服务器地址。",
       "invalid_auth": "认证失败。请检查凭据或 Token 权限。",
+      "insufficient_permissions": "该账户没有足够的权限访问所需的 Proxmox 资源。",
       "unknown": "未知错误。请查看 Home Assistant 日志。"
     },
     "abort": {
+      "scope_unavailable": "无法生成未使用的 CLUSTER 关联。请重试。",
       "no_nodes_visible": "No visible nodes were found. Check the account permissions and cluster configuration.",
       "already_configured": "该节点已经配置过。",
       "no_data": "未收到集群数据。请检查配置。",
@@ -89,7 +126,14 @@
       "guest_selection_changed": "Guest selections changed in another Options flow. Reopen Options and try again.",
       "guest_inventory_changed": "The guest inventory changed. Reopen Options and try again.",
       "invalid_guest_selection": "Only guests shown for this node can be selected.",
-      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs."
+      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs.",
+      "source_not_pve": "Only a PVE entry can associate a cluster scope.",
+      "source_scope_not_active": "This PVE entry needs an active explicit cluster scope.",
+      "target_not_cluster": "The selected entry is not a CLUSTER entry.",
+      "target_scope_invalid": "The selected CLUSTER entry has an invalid cluster scope.",
+      "target_scope_conflict": "The selected CLUSTER entry belongs to a different explicit scope.",
+      "scope_already_associated": "Another CLUSTER entry is already associated with this scope.",
+      "association_target_not_available": "The selected CLUSTER entry is no longer available."
     },
     "abort": {
       "pbs_no_options": "该 PBS 服务器没有可配置选项。",
@@ -115,7 +159,15 @@
           "enable_pbs_node_controls": "启用 PBS 节点电源控制",
           "wol_mac": "Wake-on-LAN MAC 地址",
           "verify_ssl": "验证 SSL 证书"
+          ,"cluster_scope_action": "管理集群身份",
+          "cluster_association_action": "Cluster association: select an explicitly eligible CLUSTER entry"
         }
+      }, "scope_confirm": {"title": "确认集群身份", "description": "仅保存明确的范围，不迁移实体或设备。", "data": {"confirm": "确认更改"}
+      },
+      "cluster_association_confirm": {
+        "title": "Confirm CLUSTER association",
+        "description": "Associate PVE {source} with CLUSTER {target} using scope {scope}. This does not change entities, devices, or selections.",
+        "data": {"confirm": "Confirm CLUSTER association"}
       }
     }
   },
@@ -646,6 +698,7 @@
       }
     }
   },
+  "selector": {"platform_type": {"options": {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "cluster": "Proxmox 集群"}}, "cluster_scope_action": {"options": {"keep": "保持与集群关联", "independent": "独立运行 — 不在节点间迁移 VM/LXC 实体"}}},
   "services": {
     "create_vzdump_backup": {
       "name": "Proxmox：启动备份",

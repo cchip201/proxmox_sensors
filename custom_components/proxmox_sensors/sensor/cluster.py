@@ -4,9 +4,8 @@ from __future__ import annotations
 import logging
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
-from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from ..const import DOMAIN
 
@@ -431,13 +430,17 @@ class ProxmoxClusterFirewallSensor(CoordinatorEntity, SensorEntity):
 
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator, cluster_name, entry_id):
+    def __init__(self, coordinator, cluster_name, entry_id, identity_context=None):
         super().__init__(coordinator)
         self._cluster_name = cluster_name
         self._entry_id = entry_id
 
         self._attr_translation_key = "cluster_firewall"
-        self._attr_unique_id = f"proxmox_cluster_firewall_{cluster_name}"
+        self._attr_unique_id = (
+            f"proxmox_cluster_firewall_{identity_context.scope}"
+            if identity_context and identity_context.use_scoped_identity
+            else f"proxmox_cluster_firewall_{cluster_name}"
+        )
         self._attr_icon = "mdi:shield-check"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, f"proxmox_cluster_{self._entry_id}")},
@@ -494,42 +497,13 @@ class ProxmoxClusterFirewallSensor(CoordinatorEntity, SensorEntity):
 # ---------------------------------------------------------------------------
 
 
-class ProxmoxRestoredBackupSensor(ProxmoxClusterBaseSensor, RestoreEntity):
-    """Base class for backup sensors that can survive an empty startup payload."""
-
-    _restored_state = None
-    _restored_attrs = None
-
-    async def async_added_to_hass(self):
-        await super().async_added_to_hass()
-
-        last_state = await self.async_get_last_state()
-        if last_state is None:
-            return
-
-        self._restored_state = last_state.state
-        self._restored_attrs = dict(last_state.attributes or {})
-
+class ProxmoxBackupSensor(ProxmoxClusterBaseSensor):
     def _backup_jobs(self) -> dict:
         data = self.coordinator.data.get("backup_jobs", {})
         return data if isinstance(data, dict) else {}
 
-    def _restored_attr(self, key, default=None):
-        if not isinstance(self._restored_attrs, dict):
-            return default
-        return self._restored_attrs.get(key, default)
 
-    def _restored_state_or_unknown(self):
-        if self._restored_state in (None, STATE_UNKNOWN, STATE_UNAVAILABLE):
-            return "unknown"
-        return self._restored_state
-
-    def _has_valid_run(self, backup_jobs):
-        jobs = backup_jobs.get("jobs", [])
-        return any(job.get("last_run") for job in jobs)
-
-
-class ProxmoxBackupJobsSensor(ProxmoxRestoredBackupSensor):
+class ProxmoxBackupJobsSensor(ProxmoxBackupSensor):
     """Summary sensor for Proxmox backup jobs."""
 
     def __init__(self, coordinator, entry_id: str, node: str):
@@ -540,41 +514,12 @@ class ProxmoxBackupJobsSensor(ProxmoxRestoredBackupSensor):
 
     @property
     def native_value(self):
-        backup_jobs = self._backup_jobs() or {}
-
-        jobs = backup_jobs.get("jobs", [])
-        has_valid_run = any(job.get("last_run") for job in jobs)
-
-        if not has_valid_run:
-            return self._restored_state_or_unknown()
-
-        state = backup_jobs.get("state")
-        if state and state != "unknown":
-            return state
-
-        return self._restored_state_or_unknown()
+        state = self._backup_jobs().get("state")
+        return state if state in {"ok", "error"} else "unknown"
 
     @property
     def extra_state_attributes(self):
-        backup_jobs = self._backup_jobs() or {}
-
-        jobs = backup_jobs.get("jobs", [])
-        has_valid_run = any(job.get("last_run") for job in jobs)
-
-        if not has_valid_run:
-            return {
-                "total_jobs": self._restored_attr("total_jobs", 0),
-                "failed_jobs": self._restored_attr("failed_jobs", 0),
-                "last_run": self._restored_attr("last_run"),
-                "jobs": self._restored_attr("jobs", []),
-            }
-
-        return {
-            "total_jobs": backup_jobs.get("total_jobs"),
-            "failed_jobs": backup_jobs.get("failed_jobs"),
-            "last_run": backup_jobs.get("last_run"),
-            "jobs": backup_jobs.get("jobs"),
-        }
+        return {"total_jobs": self._backup_jobs().get("total_jobs")}
 
     @property
     def icon(self):
@@ -589,7 +534,7 @@ class ProxmoxBackupJobsSensor(ProxmoxRestoredBackupSensor):
         return "mdi:help-circle"
 
 
-class ProxmoxBackupAgeSensor(ProxmoxRestoredBackupSensor):
+class ProxmoxBackupAgeSensor(ProxmoxBackupSensor):
     """Sensor for backup age in hours."""
 
     def __init__(self, coordinator, entry_id: str, node: str):
@@ -605,7 +550,7 @@ class ProxmoxBackupAgeSensor(ProxmoxRestoredBackupSensor):
     def native_value(self):
         data = self._backup_jobs()
 
-        last_run = data.get("last_run") or self._restored_attr("last_backup")
+        last_run = data.get("last_task_run")
         if last_run is None:
             return None
 
@@ -625,18 +570,17 @@ class ProxmoxBackupAgeSensor(ProxmoxRestoredBackupSensor):
     @property
     def extra_state_attributes(self):
         data = self._backup_jobs()
-        last_backup = data.get("last_run") or self._restored_attr("last_backup")
+        last_backup = data.get("last_task_run")
 
         return {
             "last_backup_ago_hours": self.native_value,
             "last_backup": last_backup,
-            "status": data.get("state") or self._restored_attr("status"),
-            "total_jobs": data.get("total_jobs", self._restored_attr("total_jobs")),
-            "failed_jobs": data.get("failed_jobs", self._restored_attr("failed_jobs")),
+            "status": data.get("state", "unknown"),
+            "total_jobs": data.get("total_jobs"),
         }
 
 
-class ProxmoxBackupHealthSensor(ProxmoxRestoredBackupSensor):
+class ProxmoxBackupHealthSensor(ProxmoxBackupSensor):
     """Sensor for backup health status."""
 
     def __init__(self, coordinator, entry_id: str, node: str):
@@ -651,11 +595,10 @@ class ProxmoxBackupHealthSensor(ProxmoxRestoredBackupSensor):
     def native_value(self):
         data = self._backup_jobs()
         age = None
-        failed = data.get("failed_jobs", self._restored_attr("failed_jobs", 0))
 
         # Reusar cálculo del backup_age si existe
         try:
-            last_run = data.get("last_run") or self._restored_attr("last_backup")
+            last_run = data.get("last_task_run")
             if last_run:
                 from dateutil import parser
                 from datetime import datetime, timezone
@@ -666,16 +609,16 @@ class ProxmoxBackupHealthSensor(ProxmoxRestoredBackupSensor):
         except Exception:
             age = None
 
-        if (age is not None and age >= 48) or failed >= 2:
+        if age is not None and age >= 48:
             return "critical"
 
-        if (age is not None and age >= 24) or failed >= 1:
+        if (age is not None and age >= 24) or data.get("state") == "error":
             return "warning"
 
-        if age is not None:
+        if age is not None and data.get("state") == "ok":
             return "healthy"
 
-        return self._restored_state_or_unknown()
+        return "unknown"
 
     @property
     def icon(self):
@@ -694,9 +637,8 @@ class ProxmoxBackupHealthSensor(ProxmoxRestoredBackupSensor):
         data = self._backup_jobs()
 
         return {
-            "last_backup": data.get("last_run") or self._restored_attr("last_backup"),
-            "failed_jobs": data.get("failed_jobs", self._restored_attr("failed_jobs")),
-            "total_jobs": data.get("total_jobs", self._restored_attr("total_jobs")),
+            "last_backup": data.get("last_task_run"),
+            "total_jobs": data.get("total_jobs"),
         }
 
 
@@ -776,7 +718,11 @@ class ProxmoxFailedTasksSensor(ProxmoxClusterBaseSensor):
         if failed:
             last_task = failed[0]
             attrs["last_failure"] = last_task["time"]
-            attrs["last_task"] = last_task
+            task_time = datetime.fromisoformat(last_task["time"])
+            attrs["last_task"] = {
+                **last_task,
+                "time": dt_util.as_local(task_time).strftime("%Y-%m-%d %H:%M:%S"),
+            }
             attrs["last_task_type"] = last_task.get("type")
             attrs["last_node"] = last_task.get("node")
         else:

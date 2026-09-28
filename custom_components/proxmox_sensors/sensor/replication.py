@@ -1,6 +1,7 @@
 """Replication summaries and stable job measurements on existing guest devices."""
 
 from datetime import datetime, timezone
+import logging
 import math
 import re
 
@@ -16,7 +17,11 @@ from ..logic.guest_selection import (
     _entry_cluster_id, get_entry_guest_selection,
     get_effective_guest_selections, selection_guest_ids,
 )
+from ..logic.guest_identity import replication_job_unique_id, replication_summary_unique_id
+from ..logic.cluster_scope import associated_cluster_for_pve, associated_pves_for_cluster
 from .cluster import ProxmoxClusterBaseSensor
+
+_LOGGER = logging.getLogger(__name__)
 
 
 SENSOR_TYPES = {
@@ -89,19 +94,29 @@ class GuestReplicationMixin:
 
     async def async_added_to_hass(self):
         await super().async_added_to_hass()
-        if self._cluster_id:
+        scope = (self._identity_context.scope if self._identity_context
+                 and self._identity_context.use_scoped_identity else self._cluster_id)
+        if scope:
             self.async_on_remove(async_dispatcher_connect(
-                self.hass, _signal(self._cluster_id), self.async_write_ha_state
+                self.hass, _signal(scope), self.async_write_ha_state
             ))
 
     def _replication_attributes(self):
-        if not self._cluster_id:
+        if not self._cluster_id and not (
+            self._identity_context and self._identity_context.use_scoped_identity
+        ):
             return {}
         guest = getattr(self, "_vm_id", getattr(self, "_ct_id", None))
         expected_type = "qemu" if hasattr(self, "_vm_id") else "lxc"
+        owner = self.coordinator.config_entry
+        entries = self.hass.config_entries.async_entries(DOMAIN)
         for entry in self.hass.config_entries.async_entries(DOMAIN):
-            if (entry.data.get(CONF_PLATFORM_TYPE) != "CLUSTER"
-                    or str(entry.data.get("cluster_name", "")).lower() != self._cluster_id):
+            if entry.data.get(CONF_PLATFORM_TYPE) != "CLUSTER":
+                continue
+            if self._identity_context and self._identity_context.use_scoped_identity:
+                if associated_cluster_for_pve(owner, entries) is not entry:
+                    continue
+            elif str(entry.data.get("cluster_name", "")).lower() != self._cluster_id:
                 continue
             stored = self.hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
             coordinator = stored.get("coordinator")
@@ -137,12 +152,17 @@ class _ExistingDeviceReplicationSensor(ProxmoxClusterBaseSensor):
 class ProxmoxReplicationSummary(_ExistingDeviceReplicationSensor):
     """Inventory count or count of known job failures for the cluster."""
 
-    def __init__(self, coordinator, entry_id, scope, kind, device):
+    def __init__(self, coordinator, entry_id, scope, kind, device, identity_context=None):
         super().__init__(coordinator, entry_id, "")
         self.device_entry = device
+        self._identity_context = identity_context
         self._kind = kind
         self._inventory_seen = False
-        self._attr_unique_id = f"pve_cluster_{scope}_replication_{kind}"
+        self._attr_unique_id = (
+            replication_summary_unique_id(identity_context.scope, kind)
+            if identity_context and identity_context.use_scoped_identity
+            else f"pve_cluster_{scope}_replication_{kind}"
+        )
         self._attr_translation_key = f"replication_{kind}"
         if kind == "jobs":
             self._attr_state_class = SensorStateClass.MEASUREMENT
@@ -177,13 +197,18 @@ class ProxmoxReplicationSummary(_ExistingDeviceReplicationSensor):
 class ProxmoxReplicationSensor(_ExistingDeviceReplicationSensor):
     """A measurement retaining its original job ID on the existing guest device."""
 
-    def __init__(self, coordinator, entry_id, scope, job_id, kind, device):
+    def __init__(self, coordinator, entry_id, scope, job_id, kind, device, identity_context=None):
         super().__init__(coordinator, entry_id, "")
         self._job_id = job_id
         self._kind = kind
         self.device_entry = device
+        self._identity_context = identity_context
         device_class = SENSOR_TYPES[kind]
-        self._attr_unique_id = f"pve_cluster_{scope}_replication_{job_id}_{kind}"
+        self._attr_unique_id = (
+            replication_job_unique_id(identity_context.scope, job_id, kind)
+            if identity_context and identity_context.use_scoped_identity
+            else f"pve_cluster_{scope}_replication_{job_id}_{kind}"
+        )
         self._attr_translation_key = f"replication_{kind}"
         self._attr_translation_placeholders = {"job_id": job_id}
         self._attr_device_class = device_class
@@ -210,18 +235,21 @@ class ProxmoxReplicationSensor(_ExistingDeviceReplicationSensor):
         return dict(self._job())
 
 
-def _replication_guest_selections(hass, scope):
+def _replication_guest_selections(hass, scope, cluster_entry=None, identity_context=None):
     """Resolve current PVE selections; None per type cannot authorize deletion."""
     unknown = {"qemu": None, "lxc": None}
-    members = []
-    for candidate in hass.config_entries.async_entries(DOMAIN):
-        if candidate.data.get(CONF_PLATFORM_TYPE) != "PVE":
-            continue
-        cluster = _entry_cluster_id(hass, candidate)
-        if cluster is None:
-            return unknown
-        if cluster == scope:
-            members.append(candidate)
+    if identity_context and identity_context.use_scoped_identity:
+        members = associated_pves_for_cluster(cluster_entry, hass.config_entries.async_entries(DOMAIN))
+    else:
+        members = []
+        for candidate in hass.config_entries.async_entries(DOMAIN):
+            if candidate.data.get(CONF_PLATFORM_TYPE) != "PVE":
+                continue
+            cluster = _entry_cluster_id(hass, candidate)
+            if cluster is None:
+                return unknown
+            if cluster == scope:
+                members.append(candidate)
     if not members:
         return unknown
     try:
@@ -239,12 +267,13 @@ def _replication_guest_selections(hass, scope):
         return unknown
 
 
-def setup_replication_sensors(hass, coordinator, entry, async_add_entities):
+def setup_replication_sensors(hass, coordinator, entry, async_add_entities, identity_context=None):
     """Reconcile only this cluster's replication family, preserving measure IDs."""
     cluster_name = entry.data.get("cluster_name")
     if not isinstance(cluster_name, str) or not cluster_name.strip():
         return
-    scope = cluster_name.lower()
+    scope = (identity_context.scope if identity_context and identity_context.use_scoped_identity
+             else cluster_name.lower())
     registry = er.async_get(hass)
     devices = dr.async_get(hass)
     prefix = f"pve_cluster_{scope}_replication_"
@@ -296,6 +325,9 @@ def setup_replication_sensors(hass, coordinator, entry, async_add_entities):
         owner = hass.config_entries.async_get_entry(status.config_entry_id)
         if owner is None or owner.data.get(CONF_PLATFORM_TYPE) != "PVE":
             return None
+        if (identity_context and identity_context.use_scoped_identity
+                and owner not in associated_pves_for_cluster(entry, hass.config_entries.async_entries(DOMAIN))):
+            return None
         identifier = (DOMAIN, f"proxmox_{kind}_cluster_{scope}_{guest}_v1")
         device = devices.async_get_device_by_identifier(
             identifier, config_entry_id=owner.entry_id
@@ -306,7 +338,7 @@ def setup_replication_sensors(hass, coordinator, entry, async_add_entities):
     def discover():
         data = coordinator.data or {}
         jobs = _jobs(data)
-        selections = _replication_guest_selections(hass, scope)
+        selections = _replication_guest_selections(hass, scope, entry, identity_context)
         excluded_jobs = set()
         for job_id, job in jobs.items():
             selected = selections.get(_vmtype(job, data))
@@ -378,7 +410,7 @@ def setup_replication_sensors(hass, coordinator, entry, async_add_entities):
                     registry.async_update_entity(entity_id, device_id=cluster_device.id)
                 if kind not in known_summaries:
                     entities.append(ProxmoxReplicationSummary(
-                        coordinator, entry.entry_id, scope, kind, cluster_device
+                        coordinator, entry.entry_id, scope, kind, cluster_device, identity_context
                     ))
                     known_summaries.add(kind)
         for job_id, job in jobs.items():
@@ -403,7 +435,7 @@ def setup_replication_sensors(hass, coordinator, entry, async_add_entities):
                     registry.async_update_entity(entity_id, device_id=device.id)
                 if job_id not in known_jobs:
                     instance = ProxmoxReplicationSensor(
-                        coordinator, entry.entry_id, scope, job_id, measure, device
+                        coordinator, entry.entry_id, scope, job_id, measure, device, identity_context
                     )
                     entities.append(instance)
                     job_instances.setdefault(job_id, []).append(instance)

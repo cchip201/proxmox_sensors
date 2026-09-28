@@ -21,6 +21,14 @@ from ..logic.guest_keys import (
     find_guest_node_in_resources,
 )
 from ..logic.guest_selection import get_cycle_guest_selections, allow_excluded_cluster_guest_cleanup
+from ..logic.cluster_scope import cluster_guest_identity_context, guest_identity_context, scoped_migration_target
+from ..logic.guest_identity import resolve_legacy_guest_identity
+from ..logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    mounted_disks_identifier,
+    node_device_identifier,
+    storage_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,7 +66,7 @@ from .cluster import (
 )
 
 # Hardware Sensors (lm-sensors)
-from .hardware import ProxmoxHardwareSensor
+from .hardware import ProxmoxHardwareSensor, detect_sensor_type
 
 # Physical Disks
 from .disks import ProxmoxDiskSensor
@@ -105,8 +113,19 @@ _LOGGER = logging.getLogger(__name__)
 
 
 
+def _legacy_guest_identity_resolver(hass, entry):
+    registry = er.async_get(hass)
+    devices = dr.async_get(hass)
+    rows = er.async_entries_for_config_entry(registry, entry.entry_id)
+    device_rows = dr.async_entries_for_config_entry(devices, entry.entry_id)
+    return lambda kind, vmid, node: resolve_legacy_guest_identity(
+        kind, vmid, node, rows, device_rows
+    )
+
+
 def _build_guest_entities(
-    coordinator, c_data: dict, node: str, selected_vms, selected_cts, cluster_id
+    coordinator, c_data: dict, node: str, selected_vms, selected_cts, cluster_id, identity_context=None,
+    legacy_identity_resolver=None
 ) -> list:
     """Build the current set of VM/CT entities from coordinator data.
 
@@ -122,10 +141,17 @@ def _build_guest_entities(
         vm_node = vm_data.get("node", node)
         if not matches_selected_guest(selected_vms, vm_node, vm_id, vm_key):
             continue
+        legacy_identity = None if identity_context and identity_context.use_scoped_identity else (
+            legacy_identity_resolver("vm", vm_id, vm_node) if legacy_identity_resolver else None
+        )
+        if legacy_identity and legacy_identity.ambiguous:
+            continue
+        identity_node = legacy_identity.node if legacy_identity and legacy_identity.node else vm_node
+        identity_cluster = legacy_identity.cluster_id if legacy_identity else None
         label = vm_data.get("name", vm_id)
         entities.append(
             ProxmoxVMSensor(
-                coordinator, vm_id, vm_node, label, guest_key=vm_key, cluster_id=cluster_id
+                coordinator, vm_id, identity_node, label, guest_key=vm_key, cluster_id=identity_cluster, identity_context=identity_context
             )
         )
         for attr, unit, icon in [
@@ -141,13 +167,13 @@ def _build_guest_entities(
                 ProxmoxVMAttributeSensor(
                     coordinator,
                     vm_id,
-                    vm_node,
+                    identity_node,
                     label,
                     attr,
                     unit,
                     icon,
                     guest_key=vm_key,
-                    cluster_id=cluster_id,
+                    cluster_id=identity_cluster, identity_context=identity_context,
                 )
             )
 
@@ -158,10 +184,17 @@ def _build_guest_entities(
         ct_node = ct_data.get("node", node)
         if not matches_selected_guest(selected_cts, ct_node, ct_id, ct_key):
             continue
+        legacy_identity = None if identity_context and identity_context.use_scoped_identity else (
+            legacy_identity_resolver("ct", ct_id, ct_node) if legacy_identity_resolver else None
+        )
+        if legacy_identity and legacy_identity.ambiguous:
+            continue
+        identity_node = legacy_identity.node if legacy_identity and legacy_identity.node else ct_node
+        identity_cluster = legacy_identity.cluster_id if legacy_identity else None
         label = ct_data.get("name", ct_id)
         entities.append(
             ProxmoxContainerSensor(
-                coordinator, ct_id, ct_node, label, guest_key=ct_key, cluster_id=cluster_id
+                coordinator, ct_id, identity_node, label, guest_key=ct_key, cluster_id=identity_cluster, identity_context=identity_context
             )
         )
         for attr, unit, icon in [
@@ -178,13 +211,13 @@ def _build_guest_entities(
                 ProxmoxContainerAttributeSensor(
                     coordinator,
                     ct_id,
-                    ct_node,
+                    identity_node,
                     label,
                     attr,
                     unit,
                     icon,
                     guest_key=ct_key,
-                    cluster_id=cluster_id,
+                    cluster_id=identity_cluster, identity_context=identity_context,
                 )
             )
 
@@ -221,7 +254,8 @@ def _guest_identity_key(kind: str, cluster_id: str, vmid) -> str:
 
 
 def _build_guest_entity_groups(
-    coordinator, c_data: dict, node: str, selected_vms, selected_cts, cluster_id
+    coordinator, c_data: dict, node: str, selected_vms, selected_cts, cluster_id, identity_context=None,
+    legacy_identity_resolver=None
 ) -> dict:
     """Build cluster-scoped VM/CT entities grouped by guest identity.
 
@@ -233,77 +267,33 @@ def _build_guest_entity_groups(
     is not possible/safe without a stable cluster-wide identity.
     """
     groups: dict = {}
-    if not cluster_id:
+    if not cluster_id and not (identity_context and identity_context.use_scoped_identity):
         return groups
-
-    vm_map = c_data.get("vms", {})
-    for vm_key, vm_data in vm_map.items():
-        vm_id = vm_data.get("vmid", vm_key)
-        vm_node = vm_data.get("node", node)
-        if not matches_selected_guest(selected_vms, vm_node, vm_id, vm_key):
-            continue
-        label = vm_data.get("name", vm_id)
-        entities = [
-            ProxmoxVMSensor(
-                coordinator, vm_id, vm_node, label, guest_key=vm_key, cluster_id=cluster_id
-            )
-        ]
-        for attr, unit, icon in _VM_ATTR_SENSORS:
-            entities.append(
-                ProxmoxVMAttributeSensor(
-                    coordinator,
-                    vm_id,
-                    vm_node,
-                    label,
-                    attr,
-                    unit,
-                    icon,
-                    guest_key=vm_key,
-                    cluster_id=cluster_id,
-                )
-            )
-        groups[_guest_identity_key("vm", cluster_id, vm_id)] = entities
-
-    ct_map = c_data.get("cts", {})
-    for ct_key, ct_data in ct_map.items():
-        ct_id = ct_data.get("vmid", ct_key)
-        ct_node = ct_data.get("node", node)
-        if not matches_selected_guest(selected_cts, ct_node, ct_id, ct_key):
-            continue
-        label = ct_data.get("name", ct_id)
-        entities = [
-            ProxmoxContainerSensor(
-                coordinator, ct_id, ct_node, label, guest_key=ct_key, cluster_id=cluster_id
-            )
-        ]
-        for attr, unit, icon in _CT_ATTR_SENSORS:
-            entities.append(
-                ProxmoxContainerAttributeSensor(
-                    coordinator,
-                    ct_id,
-                    ct_node,
-                    label,
-                    attr,
-                    unit,
-                    icon,
-                    guest_key=ct_key,
-                    cluster_id=cluster_id,
-                )
-            )
-        groups[_guest_identity_key("ct", cluster_id, ct_id)] = entities
-
+    for entity in _build_guest_entities(
+        coordinator, c_data, node, selected_vms, selected_cts, cluster_id,
+        identity_context, legacy_identity_resolver,
+    ):
+        if isinstance(entity, (ProxmoxVMSensor, ProxmoxVMAttributeSensor)):
+            kind, vmid = "vm", entity._vm_id
+        else:
+            kind, vmid = "ct", entity._ct_id
+        scope = identity_context.scope if identity_context and identity_context.use_scoped_identity else (
+            getattr(entity, "_cluster_id", None) or getattr(entity, "_node", None)
+        )
+        groups.setdefault(_guest_identity_key(kind, scope, vmid), []).append(entity)
     return groups
 
 
-def _group_existing_entities_by_guest(guest_entities, cluster_id) -> dict:
+def _group_existing_entities_by_guest(guest_entities, cluster_id, identity_context=None) -> dict:
 
     groups: dict = {}
-    if not cluster_id:
+    scoped = bool(identity_context and identity_context.use_scoped_identity)
+    if not cluster_id and not scoped:
         return groups
 
     for e in guest_entities:
-        e_cluster_id = getattr(e, "_cluster_id", None)
-        if not e_cluster_id:
+        scope = identity_context.scope if scoped else getattr(e, "_cluster_id", None)
+        if not scope:
             continue
         if isinstance(e, (ProxmoxVMSensor, ProxmoxVMAttributeSensor)):
             kind = "vm"
@@ -313,7 +303,7 @@ def _group_existing_entities_by_guest(guest_entities, cluster_id) -> dict:
             vmid = e._ct_id
         else:
             continue
-        gkey = _guest_identity_key(kind, e_cluster_id, vmid)
+        gkey = _guest_identity_key(kind, scope, vmid)
         groups.setdefault(gkey, []).append(e)
 
     return groups
@@ -335,11 +325,13 @@ def _setup_guest_reconciliation(
     pending_groups: dict = dict(initial_pending_groups or {})
     live_guest_instances: dict = {}
     missing_everywhere_counter: dict = {}
-
     @callback
     def _reconcile():
         c_data = coordinator.data or {}
         cluster_id = resolve_cluster_id(hass, c_data)
+        identity_context = guest_identity_context(entry, cluster_id)
+        resolver_factory = globals().get("_legacy_guest_identity_resolver")
+        legacy_identity_resolver = resolver_factory(hass, entry) if resolver_factory else None
         ent_reg = er.async_get(hass)
         effective_selected_vms, effective_selected_cts = get_cycle_guest_selections(
             hass, entry, c_data, selected_vms, selected_cts, cluster_id
@@ -352,9 +344,11 @@ def _setup_guest_reconciliation(
             effective_selected_vms,
             effective_selected_cts,
             cluster_id,
+            identity_context,
+            legacy_identity_resolver,
         )
 
-        if cluster_id:
+        if cluster_id or identity_context.use_scoped_identity:
             current_groups = _build_guest_entity_groups(
                 coordinator,
                 c_data,
@@ -362,6 +356,8 @@ def _setup_guest_reconciliation(
                 effective_selected_vms,
                 effective_selected_cts,
                 cluster_id,
+                identity_context,
+                legacy_identity_resolver,
             )
 
             cluster_resources = c_data.get("cluster_resources", [])
@@ -423,6 +419,14 @@ def _setup_guest_reconciliation(
                     and located_node.lower() in configured_pve_nodes
                 ):
 
+                    target_entry = None
+                    if identity_context and identity_context.use_scoped_identity:
+                        target_entry = scoped_migration_target(
+                            entry, hass.config_entries.async_entries(DOMAIN), located_node
+                        )
+                        if target_entry is None:
+                            continue
+
                     _LOGGER.info(
                         "Guest %s %s migrated from %s to %s; releasing local "
                         "instances via entity.async_remove(force_remove=False) "
@@ -436,9 +440,10 @@ def _setup_guest_reconciliation(
                         on_guest_release(kind, _cluster, vmid_str, located_node)
                     entities_to_release = live_guest_instances.pop(gkey)
                     for entity_obj in entities_to_release:
-                        hass.async_create_task(
-                            entity_obj.async_remove(force_remove=False)
-                        )
+                        if getattr(entity_obj, "hass", None) is not None:
+                            hass.async_create_task(
+                                entity_obj.async_remove(force_remove=False)
+                            )
                     known_unique_ids.difference_update(
                         e._attr_unique_id for e in entities_to_release
                     )
@@ -500,7 +505,6 @@ def _setup_guest_reconciliation(
                         continue
 
                     pending_groups[gkey] = ents
-
                     async_add_entities(ents)
                     continue
 
@@ -517,7 +521,8 @@ def _setup_guest_reconciliation(
             e
             for e in current_entities
             if e._attr_unique_id not in known_unique_ids
-            and not (cluster_id and e._attr_unique_id.startswith("pve_cluster_"))
+            and not ((cluster_id or identity_context.use_scoped_identity)
+                     and e._attr_unique_id.startswith("pve_cluster_"))
         ]
         if new_entities:
             async_add_entities(new_entities)
@@ -596,6 +601,86 @@ def _cleanup_section_for_unique_id(unique_id, entry, server_type):
     return None
 
 
+def _setup_storage_reconciliation(hass, entry, coordinator, node, storage_groups):
+    deleting = {}
+    devices = dr.async_get(hass)
+    context = coordinator_pve_local_identity_context(coordinator)
+    prefix = storage_device_identifier(context, str(node).lower(), "")
+    for device in dr.async_entries_for_config_entry(devices, entry.entry_id):
+        for domain, identifier in device.identifiers:
+            if (domain == DOMAIN and isinstance(identifier, str)
+                    and identifier.startswith(prefix) and identifier != prefix):
+                storage_groups.setdefault(identifier[len(prefix):], [])
+
+    async def _remove_storage(storage_name, instances):
+        try:
+            for entity in instances:
+                if getattr(entity, "hass", None) is not None:
+                    await entity.async_remove(force_remove=True)
+
+            registry = er.async_get(hass)
+            unique_ids = {entity._attr_unique_id for entity in instances}
+            identifier = (
+                DOMAIN,
+                storage_device_identifier(context, str(node).lower(), storage_name),
+            )
+            matching_devices = [
+                candidate
+                for candidate in dr.async_entries_for_config_entry(
+                    devices, entry.entry_id
+                )
+                if identifier in candidate.identifiers
+            ]
+            device = matching_devices[0] if len(matching_devices) == 1 else None
+            for row in er.async_entries_for_config_entry(registry, entry.entry_id):
+                if row.domain != "sensor" or row.platform != DOMAIN:
+                    continue
+                if (row.unique_id not in unique_ids
+                        and (device is None or row.device_id != device.id
+                             or _cleanup_section_for_unique_id(
+                                 row.unique_id, entry, "PVE"
+                             ) != "storage")):
+                    continue
+                current = registry.async_get(row.entity_id)
+                if (current is not None and current.unique_id == row.unique_id
+                        and current.config_entry_id == entry.entry_id):
+                    registry.async_remove(row.entity_id)
+
+            if device is not None:
+                rows = er.async_entries_for_device(
+                    registry, device.id, include_disabled_entities=True
+                )
+                children = dr.async_entries_for_parent_device(devices, device.id)
+                referenced = any(
+                    other.via_device_id == device.id
+                    for other in devices.async_get_devices()
+                )
+                if not rows and not children and not referenced:
+                    devices.async_remove_device(device.id)
+            storage_groups.pop(storage_name, None)
+        except Exception:
+            _LOGGER.exception("Failed to reconcile removed storage %s", storage_name)
+        finally:
+            deleting.pop(storage_name, None)
+
+    @callback
+    def _reconcile():
+        c_data = coordinator.data or {}
+        if c_data.get("_cleanup_confirmed", {}).get("storage") is not True:
+            return
+        current = c_data.get("storage")
+        if not isinstance(current, dict):
+            return
+        for storage_name, instances in list(storage_groups.items()):
+            if storage_name in current or storage_name in deleting:
+                continue
+            deleting[storage_name] = hass.async_create_task(
+                _remove_storage(storage_name, instances)
+            )
+
+    entry.async_on_unload(coordinator.async_add_listener(_reconcile))
+
+
 def _pbs_last_action_unique_id(server_id: str, store: str) -> str:
     return f"pbs_{server_id.lower()}_{store.lower()}_last_action"
 
@@ -646,6 +731,19 @@ def _reconcile_pbs_last_action_unique_ids(
             legacy_unique_id,
             scoped_unique_id,
         )
+
+
+_CPU_SENSOR_KEYS = [
+    "coretemp",
+    "core",
+    "package",
+    "cpu",
+    "k10temp",
+    "zenpower",
+    "tctl",
+    "tdie",
+    "tccd",
+]
 
 
 async def async_setup_entry(
@@ -704,6 +802,7 @@ async def async_setup_entry(
     server_type = hass.data[DOMAIN][entry.entry_id].get("server_type", "PVE")
 
     entities = []
+    storage_entity_groups = {}
     c_data = coordinator.data
 
     if not c_data:
@@ -720,11 +819,13 @@ async def async_setup_entry(
     # =================PVE SECTION===================
     if server_type == "PVE":
         device_registry = dr.async_get(hass)
+        local_identity = coordinator_pve_local_identity_context(coordinator)
+        node_identifier = node_device_identifier(local_identity, node)
 
         # Create BOTH devices BEFORE entities
         device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, f"proxmox_node_{node}")},
+            identifiers={(DOMAIN, node_identifier)},
             manufacturer="Proxmox",
             model="Proxmox Node",
             name=f"Node: {node}",
@@ -732,22 +833,16 @@ async def async_setup_entry(
 
         device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, f"pve_{node}_node_{node}")},
-            manufacturer="Proxmox",
-            model="Proxmox Node",
-            name=f"Node: {node}",
-        )
-
-        device_registry.async_get_or_create(
-            config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, f"mounted_disks_{node}")},
+            identifiers={(
+                DOMAIN, mounted_disks_identifier(local_identity, node)
+            )},
             manufacturer="Proxmox",
             model="Mounted Disks",
             name=f"6. Mounted Disks: {node}",
         )
 
         node_device = device_registry.async_get_device_by_identifier(
-            (DOMAIN, f"proxmox_node_{node}"), config_entry_id=entry.entry_id
+            (DOMAIN, node_identifier), config_entry_id=entry.entry_id
         )
         if node_device is not None:
             entities.append(ProxmoxSidecarStatusSensor(coordinator, node, node_device))
@@ -782,23 +877,13 @@ async def async_setup_entry(
             chipset_created = False
 
             # First: Classify all sensors
-            for key in hardware_data:
+            for key, value in hardware_data.items():
                 sid = key.lower()
 
-                # CPU
-                if any(
-                    x in sid
-                    for x in [
-                        "coretemp",
-                        "core",
-                        "package",
-                        "cpu",
-                        "k10temp",
-                        "zenpower",
-                        "tctl",
-                        "tdie",
-                        "tccd",
-                    ]
+                # CPU: only real temperature channels may claim the CPU slot
+                if (
+                    detect_sensor_type(value) == "temperature"
+                    and any(x in sid for x in _CPU_SENSOR_KEYS)
                 ):
                     cpu_sensors.append(key)
 
@@ -853,19 +938,9 @@ async def async_setup_entry(
                     continue
 
                 # ---------------- CPU (only one) ----------------
-                if any(
-                    x in sid
-                    for x in [
-                        "coretemp",
-                        "core",
-                        "package",
-                        "cpu",
-                        "k10temp",
-                        "zenpower",
-                        "tctl",
-                        "tdie",
-                        "tccd",
-                    ]
+                if (
+                    detect_sensor_type(hardware_data[key]) == "temperature"
+                    and any(x in sid for x in _CPU_SENSOR_KEYS)
                 ):
                     if cpu_created:
                         continue
@@ -961,10 +1036,6 @@ async def async_setup_entry(
             if st_name in created_storages:
                 continue
 
-            # Skip offline storages
-            if st.get("active") != 1:
-                continue
-
             # -------- INTELLIGENT FILTER --------
             is_shared = st.get("shared", 0) == 1
             storage_node = st.get("node")
@@ -997,7 +1068,9 @@ async def async_setup_entry(
 
             created_storages.add(st_name)
 
-            entities.append(ProxmoxStorageSensor(coordinator, st_name, st, node))
+            storage_entities = [
+                ProxmoxStorageSensor(coordinator, st_name, st, node)
+            ]
 
             for label, key in [
                 ("Used Space", "used"),
@@ -1005,11 +1078,13 @@ async def async_setup_entry(
                 ("Total Capacity", "total"),
                 ("Type", "type"),
             ]:
-                entities.append(
+                storage_entities.append(
                     ProxmoxStorageAttributeSensor(
                         coordinator, st_name, st, label, key, node
                     )
                 )
+            storage_entity_groups[st_name] = storage_entities
+            entities.extend(storage_entities)
 
         # -------- ZFS POOLS --------
         zfs_data = c_data.get("zfs_pools", {})
@@ -1019,6 +1094,9 @@ async def async_setup_entry(
 
         # Virtual Machines & Containers (cluster-migration aware)
         cluster_id = resolve_cluster_id(hass, c_data)
+        identity_context = guest_identity_context(entry, cluster_id)
+        resolver_factory = globals().get("_legacy_guest_identity_resolver")
+        legacy_identity_resolver = resolver_factory(hass, entry) if resolver_factory else None
         effective_selected_vms, effective_selected_cts = get_cycle_guest_selections(
             hass, entry, c_data, selected_vms, selected_cts, cluster_id
         )
@@ -1029,6 +1107,8 @@ async def async_setup_entry(
             effective_selected_vms,
             effective_selected_cts,
             cluster_id,
+            identity_context,
+            legacy_identity_resolver,
         )
         entities.extend(guest_entities)
 
@@ -1068,8 +1148,11 @@ async def async_setup_entry(
         entities.append(ProxmoxClusterVMsSensor(coordinator, entry.entry_id, node))
         entities.append(ProxmoxClusterCTsSensor(coordinator, entry.entry_id, node))
         entities.append(ProxmoxClusterStorageSensor(coordinator, entry.entry_id, node))
+        cluster_context = cluster_guest_identity_context(
+            entry, hass.config_entries.async_entries(DOMAIN), cluster_name
+        )
         entities.append(
-            ProxmoxClusterFirewallSensor(coordinator, cluster_name, entry.entry_id)
+            ProxmoxClusterFirewallSensor(coordinator, cluster_name, entry.entry_id, cluster_context)
         )
         entities.append(ProxmoxBackupJobsSensor(coordinator, entry.entry_id, node))
         if c_data.get("cluster_ha"):
@@ -1154,6 +1237,22 @@ async def async_setup_entry(
     existing_entries = er.async_entries_for_config_entry(ent_reg, entry.entry_id)
     new_unique_ids = {getattr(entity, "_attr_unique_id", None) for entity in entities}
     cleanup_confirmed = c_data.get("_cleanup_confirmed", {})
+    dev_reg = dr.async_get(hass)
+    present_storage_device_ids = set()
+    if server_type == "PVE" and cleanup_confirmed.get("storage") is True:
+        context = coordinator_pve_local_identity_context(coordinator)
+        for storage_name in c_data.get("storage", {}):
+            device = dev_reg.async_get_device_by_identifier(
+                (
+                    DOMAIN,
+                    storage_device_identifier(
+                        context, str(node).lower(), storage_name
+                    ),
+                ),
+                config_entry_id=entry.entry_id,
+            )
+            if device is not None:
+                present_storage_device_ids.add(device.id)
     legacy_pbs_last_action_ids = set()
     if server_type == "PBS":
         legacy_pbs_last_action_ids = {
@@ -1162,8 +1261,6 @@ async def async_setup_entry(
         }
 
     for entity_entry in existing_entries:
-        # This cleanup belongs only to the sensor platform.
-        # Never remove button, binary_sensor or entities from other platforms.
         if entity_entry.domain != "sensor":
             continue
 
@@ -1173,15 +1270,14 @@ async def async_setup_entry(
         if entity_entry.unique_id in legacy_pbs_last_action_ids:
             continue
 
-        # A PVE reload is not evidence that a VM/CT was intentionally removed.
-        # In particular, a temporarily empty local/cluster inventory, a failed
-        # API call, or an empty selection builds no guest entities for this
-        # cycle.  Retain registry rows until an explicit guest-identity
-        # migration can make a safe, deliberate change.
         cleanup_section = _cleanup_section_for_unique_id(
             entity_entry.unique_id, entry, server_type
         )
         if server_type == "PVE" and cleanup_section in {"vms", "cts"}:
+            continue
+
+        if (cleanup_section == "storage"
+                and entity_entry.device_id in present_storage_device_ids):
             continue
 
         if (entity_entry.unique_id or "").startswith("pve_cluster_"):
@@ -1200,10 +1296,10 @@ async def async_setup_entry(
 
         _LOGGER.info("Removing obsolete entity: %s", entity_entry.entity_id)
         ent_reg.async_remove(entity_entry.entity_id)
-    dev_reg = dr.async_get(hass)
     devices = dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
     for device in devices:
-        # Guest devices require explicit exclusion, not merely an empty registry.
+        if server_type == "PBS" and not coordinator.last_update_success:
+            continue
         if any(domain == DOMAIN and identifier.startswith(("proxmox_vm_", "proxmox_ct_"))
                for domain, identifier in device.identifiers):
             continue
@@ -1214,10 +1310,18 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
+    if server_type == "PVE":
+        _setup_storage_reconciliation(
+            hass, entry, coordinator, node, storage_entity_groups
+        )
+
     if server_type == "CLUSTER":
         from .replication import setup_replication_sensors
 
-        setup_replication_sensors(hass, coordinator, entry, async_add_entities)
+        context = cluster_guest_identity_context(
+            entry, hass.config_entries.async_entries(DOMAIN), entry.data.get("cluster_name")
+        )
+        setup_replication_sensors(hass, coordinator, entry, async_add_entities, context)
 
     # Live VM/CT migration handling
     if server_type == "PVE":
@@ -1225,12 +1329,13 @@ async def async_setup_entry(
         known_guest_ids = {
             getattr(e, "_attr_unique_id", None)
             for e in guest_entities
-            if not (cluster_id and getattr(e, "_cluster_id", None))
+            if not ((identity_context and identity_context.use_scoped_identity)
+                    or (cluster_id and getattr(e, "_cluster_id", None)))
         }
         known_guest_ids.discard(None)
 
         initial_pending_groups = _group_existing_entities_by_guest(
-            guest_entities, cluster_id
+            guest_entities, cluster_id, identity_context
         )
 
         _setup_guest_reconciliation(

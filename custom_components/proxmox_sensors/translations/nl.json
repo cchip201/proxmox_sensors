@@ -25,7 +25,6 @@
           "token_id": "Token-ID (zonder gebruiker@pve!)",
           "token_secret": "Token Geheim",
           "auto_detect_node": "Knooppunt automatisch detecteren van host-IP",
-          "enable_lm_sensors": "Hardwaresensoren en temperaturen inschakelen",
           "enable_cluster": "Cluster-brede bewaking inschakelen",
           "verify_ssl": "SSL-certificaat verifiëren"
         }
@@ -43,7 +42,7 @@
       },
       "credentials_cluster": {
         "title": "3. Toegangsgegevens — Proxmox Cluster",
-        "description": "Voer de gegevens in om verbinding te maken met het cluster. Gebruikt dezelfde API als PVE (poort 8006).",
+        "description": "Voer de aanmeldgegevens van de CLUSTER in (PVE-API, poort 8006). Voor PVE-vermeldingen zonder CLUSTER kunt u een nieuwe koppeling maken of er expliciet een herstellen.",
         "data": {
           "user": "Gebruiker (bijv. root@pam)",
           "password": "Wachtwoord",
@@ -52,11 +51,44 @@
           "verify_ssl": "SSL-certificaat verifiëren"
         }
       },
+      "cluster_association": {
+        "title": "CLUSTER-koppeling",
+        "description": "Maak een nieuwe koppeling of herstel die van PVE-vermeldingen zonder gekoppelde CLUSTER. Namen en hosts bepalen nooit het lidmaatschap.",
+        "menu_options": {
+          "new_cluster_association": "Nieuwe koppeling maken",
+          "recover_cluster_scope": "Koppeling van bestaande PVE-vermeldingen herstellen"
+        }
+      },
+      "recover_cluster_scope": {
+        "title": "PVE-vermeldingen zonder gekoppelde CLUSTER",
+        "description": "Kies de PVE-groep die bij deze fysieke CLUSTER hoort. Een onafhankelijke PVE kan hier verschijnen; controleer alle leden.",
+        "data": {"scope": "PVE-groep"}
+      },
+      "confirm_cluster_recovery": {
+        "title": "Herstel van CLUSTER-koppeling bevestigen",
+        "description": "Bevestig dat deze fysieke CLUSTER alle volgende PVE-vermeldingen bevat: {pves}. Hun bestaande identiteit wordt hergebruikt.",
+        "data": {"confirm": "Deze koppeling herstellen"}
+      },
       "select_node": {
         "title": "4. Selecteer Knooppunt",
         "description": "Selecteer het Proxmox-knooppunt om te bewaken.",
         "data": {
           "node": "Knooppunt"
+        }
+      },
+      "pve_membership": {
+        "title": "Serverlidmaatschap",
+        "description": "Kies of deze server zich aansluit bij een geconfigureerd cluster of onafhankelijk is. Alleen beschikbare clusters worden getoond.",
+        "menu_options": {
+          "join_cluster": "Aansluiten bij een geconfigureerd cluster",
+          "independent": "Onafhankelijke server of cluster configureren"
+        }
+      },
+      "join_cluster": {
+        "title": "Kies een cluster",
+        "description": "Selecteer het cluster waartoe deze server behoort. Deze keuze bepaalt welke nodes gastentiteiten kunnen delen.",
+        "data": {
+          "cluster": "Cluster"
         }
       },
       "select_resources": {
@@ -67,16 +99,21 @@
           "cts": "Containers (LXC)",
           "storage": "Opslag",
           "enable_physical_disks": "Bewaking van fysieke schijven inschakelen",
+          "enable_lm_sensors": "Hardwaresensoren en temperaturen inschakelen",
           "enable_node_controls": "Knooppunt-energiebediening inschakelen"
         }
       }
     },
     "error": {
+      "recovery_unavailable": "De PVE-groep is gewijzigd of de identiteit conflicteert met de Registry. Kies opnieuw; er is geen CLUSTER gemaakt.",
+      "cluster_unavailable": "Het geselecteerde cluster is niet meer beschikbaar om aan te sluiten. Ga terug of selecteer een ander cluster.",
       "cannot_connect": "Verbindingsfout. Controleer het serveradres.",
       "invalid_auth": "Authenticatie mislukt. Controleer de gegevens of tokenrechten.",
+      "insufficient_permissions": "Het account heeft onvoldoende rechten om toegang te krijgen tot de vereiste Proxmox-resources.",
       "unknown": "Onverwachte fout. Controleer de Home Assistant-logboeken."
     },
     "abort": {
+      "scope_unavailable": "Kan geen vrije CLUSTER-koppeling maken. Probeer opnieuw.",
       "no_nodes_visible": "No visible nodes were found. Check the account permissions and cluster configuration.",
       "already_configured": "Dit knooppunt is al geconfigureerd.",
       "no_data": "Geen clustergegevens ontvangen. Controleer uw configuratie.",
@@ -89,7 +126,14 @@
       "guest_selection_changed": "Guest selections changed in another Options flow. Reopen Options and try again.",
       "guest_inventory_changed": "The guest inventory changed. Reopen Options and try again.",
       "invalid_guest_selection": "Only guests shown for this node can be selected.",
-      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs."
+      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs.",
+      "source_not_pve": "Only a PVE entry can associate a cluster scope.",
+      "source_scope_not_active": "This PVE entry needs an active explicit cluster scope.",
+      "target_not_cluster": "The selected entry is not a CLUSTER entry.",
+      "target_scope_invalid": "The selected CLUSTER entry has an invalid cluster scope.",
+      "target_scope_conflict": "The selected CLUSTER entry belongs to a different explicit scope.",
+      "scope_already_associated": "Another CLUSTER entry is already associated with this scope.",
+      "association_target_not_available": "The selected CLUSTER entry is no longer available."
     },
     "abort": {
       "pbs_no_options": "Deze PBS-server heeft geen configureerbare opties.",
@@ -115,7 +159,15 @@
           "enable_pbs_node_controls": "PBS-knooppunt-energiebediening inschakelen",
           "wol_mac": "Wake-on-LAN MAC-adres",
           "verify_ssl": "SSL-certificaat verifiëren"
+          ,"cluster_scope_action": "Clusteridentiteit beheren",
+          "cluster_association_action": "Cluster association: select an explicitly eligible CLUSTER entry"
         }
+      }, "scope_confirm": {"title": "Clusteridentiteit bevestigen", "description": "Slaat alleen het expliciete bereik op. Entiteiten en apparaten worden niet gemigreerd.", "data": {"confirm": "Wijziging bevestigen"}
+      },
+      "cluster_association_confirm": {
+        "title": "Confirm CLUSTER association",
+        "description": "Associate PVE {source} with CLUSTER {target} using scope {scope}. This does not change entities, devices, or selections.",
+        "data": {"confirm": "Confirm CLUSTER association"}
       }
     }
   },
@@ -646,6 +698,7 @@
       }
     }
   },
+  "selector": {"platform_type": {"options": {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "cluster": "Proxmox-cluster"}}, "cluster_scope_action": {"options": {"keep": "Gekoppeld blijven aan het cluster", "independent": "Onafhankelijk — geen migratie van VM/LXC-entiteiten tussen knooppunten"}}},
   "services": {
     "create_vzdump_backup": {
       "name": "Proxmox: Backup starten",

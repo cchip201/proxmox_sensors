@@ -6,6 +6,11 @@ from homeassistant.helpers import device_registry as dr
 
 from .base import ProxmoxBaseSensor
 from ..const import DOMAIN
+from ..logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    node_device_identifier,
+    storage_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,9 +46,12 @@ class ProxmoxStorageSensor(ProxmoxBaseSensor):
     @property
     def device_info(self):
         node_id = (self._node or "node").lower()
+        context = coordinator_pve_local_identity_context(self.coordinator)
         info = {
             "identifiers": {
-                (DOMAIN, f"proxmox_storage_{node_id}_{self._storage_name}")
+                (DOMAIN, storage_device_identifier(
+                    context, node_id, self._storage_name
+                ))
             },
             "name": f"5. Storage: {self._storage_name}",
             "manufacturer": "Proxmox",
@@ -53,7 +61,7 @@ class ProxmoxStorageSensor(ProxmoxBaseSensor):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(context, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:
@@ -134,9 +142,12 @@ class ProxmoxStorageAttributeSensor(ProxmoxBaseSensor):
     @property
     def device_info(self):
         node_id = (self._node or "node").lower()
+        context = coordinator_pve_local_identity_context(self.coordinator)
         return {
             "identifiers": {
-                (DOMAIN, f"proxmox_storage_{node_id}_{self._storage_name}")
+                (DOMAIN, storage_device_identifier(
+                    context, node_id, self._storage_name
+                ))
             },
             "name": f"5. Storage: {self._storage_name}",
         }

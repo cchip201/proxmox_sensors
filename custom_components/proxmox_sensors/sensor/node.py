@@ -2,6 +2,20 @@
 
 from .base import ProxmoxBaseSensor
 from ..const import DOMAIN
+from ..logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    mounted_disks_identifier,
+    node_device_identifier,
+)
+from ..logic.cluster_scope import (
+    ACTIVE_SCOPE,
+    INVALID_SCOPE,
+    LEGACY_SCOPE,
+    PENDING_SCOPE,
+    associated_cluster_for_pve,
+    cluster_scope_status,
+    entry_cluster_scope_id,
+)
 from ..logic.node_metrics import (
     build_cluster_task_attributes,
     build_cpu_sensor_attributes,
@@ -483,7 +497,12 @@ class ProxmoxNodesSensor(CoordinatorEntity, SensorEntity):
         self._attr_icon = "mdi:server"
 
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"proxmox_node_{self._node}")},
+            "identifiers": {(
+                DOMAIN,
+                node_device_identifier(
+                    coordinator_pve_local_identity_context(coordinator), self._node
+                ),
+            )},
             "manufacturer": "Proxmox",
             "model": "Proxmox Node",
             "name": f"1. Node: {self._node}",
@@ -502,7 +521,88 @@ class ProxmoxNodesSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        return build_node_overview_attributes(self.coordinator.data, self._node)
+        attributes = build_node_overview_attributes(self.coordinator.data, self._node)
+        attributes.update(self._cluster_association_attributes())
+        return attributes
+
+    def _cluster_association_attributes(self):
+        attributes = {
+            "cluster_association_status": "incomplete",
+            "cluster_scope_id": None,
+            "cluster_scope_state": None,
+            "cluster_scope_status": "legacy",
+            "associated_cluster_entry_id": None,
+            "associated_cluster_title": None,
+            "associated_cluster_name": None,
+        }
+        hass = getattr(self, "hass", None)
+        config_entries = getattr(hass, "config_entries", None)
+        if config_entries is None:
+            return attributes
+
+        entries = list(config_entries.async_entries(DOMAIN))
+        pve_entry = config_entries.async_get_entry(self._entry_id)
+        if pve_entry is None:
+            pve_entry = next(
+                (
+                    entry
+                    for entry in entries
+                    if getattr(entry, "entry_id", None) == self._entry_id
+                ),
+                None,
+            )
+        if pve_entry is None:
+            return attributes
+
+        data = getattr(pve_entry, "data", {}) or {}
+        status = cluster_scope_status(pve_entry)
+        scope = entry_cluster_scope_id(pve_entry)
+        attributes.update(
+            cluster_scope_id=data.get("cluster_scope_id"),
+            cluster_scope_state=data.get("cluster_scope_state"),
+            cluster_scope_status=status,
+        )
+
+        if status == LEGACY_SCOPE:
+            attributes["cluster_association_status"] = "legacy"
+            return attributes
+        if status == INVALID_SCOPE:
+            attributes["cluster_association_status"] = "invalid"
+            return attributes
+        if scope is None:
+            return attributes
+
+        matches = [
+            entry
+            for entry in entries
+            if str((getattr(entry, "data", {}) or {}).get("platform_type", "")).upper()
+            == "CLUSTER"
+            and entry_cluster_scope_id(entry) == scope
+        ]
+        if len(matches) > 1:
+            attributes["cluster_association_status"] = "ambiguous"
+            return attributes
+
+        cluster_entry = matches[0] if matches else None
+        if cluster_entry is not None:
+            cluster_data = getattr(cluster_entry, "data", {}) or {}
+            attributes.update(
+                associated_cluster_entry_id=cluster_entry.entry_id,
+                associated_cluster_title=getattr(cluster_entry, "title", None),
+                associated_cluster_name=cluster_data.get("cluster_name"),
+            )
+
+        if status == PENDING_SCOPE:
+            attributes["cluster_association_status"] = "pending"
+        elif status != ACTIVE_SCOPE:
+            attributes["cluster_association_status"] = "incomplete"
+        elif cluster_entry is None:
+            attributes["cluster_association_status"] = "independent"
+        elif associated_cluster_for_pve(pve_entry, entries) is cluster_entry:
+            attributes["cluster_association_status"] = "associated"
+        else:
+            attributes["cluster_association_status"] = "cluster_inactive"
+        return attributes
 
 
 class ProxmoxStoragesSensor(CoordinatorEntity, SensorEntity):
@@ -556,7 +656,12 @@ class ProxmoxStoragesSensor(CoordinatorEntity, SensorEntity):
         display_node = self._node.capitalize()
 
         return {
-            "identifiers": {(DOMAIN, f"proxmox_node_{node_id}")},
+            "identifiers": {(
+                DOMAIN,
+                node_device_identifier(
+                    coordinator_pve_local_identity_context(self.coordinator), node_id
+                ),
+            )},
             "name": f"1. Node: {display_node}",
             "manufacturer": "Proxmox",
             "model": "Proxmox Node",
@@ -737,7 +842,13 @@ class ProxmoxNodeMountedDisksSensor(ProxmoxBaseSensor):
     @property
     def device_info(self):
         return {
-            "identifiers": {(DOMAIN, f"mounted_disks_{self._node}")},
+            "identifiers": {(
+                DOMAIN,
+                mounted_disks_identifier(
+                    coordinator_pve_local_identity_context(self.coordinator),
+                    self._node,
+                ),
+            )},
             "name": f"6. Mounted Disks: {self._node}",
             "manufacturer": "Proxmox",
             "model": "node_mounted_disks",

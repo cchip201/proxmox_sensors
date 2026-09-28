@@ -98,7 +98,7 @@ def build_inventory(entries, rows, devices, states, selections=None):
             "resource_id": info["key"], "kind": info["kind"],
             "title": (getattr(device_for_name, "name_by_user", None)
                       or getattr(device_for_name, "name", None) or info["label"])
-                     if info["kind"] in ("vm", "ct", "datastore", "storage") else info["label"],
+                     if info["kind"] in ("vm", "ct", "datastore") else info["label"],
             "entry_id": display_owner["entry_id"], "cluster_id": display_owner.get("cluster_id"),
             "node": display_owner.get("node"), "server_id": display_owner.get("server_id"),
             "guest_id": info["guest"][2] if info.get("guest") else None,
@@ -134,27 +134,57 @@ def discover_inventory(hass):
         _entry_cluster_id, get_effective_guest_selections, get_entry_guest_selection,
         selection_guest_ids,
     )
+    from ..logic.cluster_scope import (
+        associated_cluster_for_pve,
+        associated_pves_for_cluster,
+        cluster_guest_identity_context,
+        entry_cluster_scope_id,
+        guest_identity_context,
+    )
+    from ..logic.pve_local_identity import PveLocalIdentityError, pve_local_identity_context
 
     entries = list(hass.config_entries.async_entries(DOMAIN))
     normalized, rows, selections = [], [], {}
     registry = er.async_get(hass)
     for entry in entries:
         platform = (entry.data.get("platform_type") or entry.data.get("server_type") or "").upper()
-        cluster = (str(entry.data.get("cluster_name", "")).lower() or None) if platform == "CLUSTER" else _entry_cluster_id(hass, entry)
+        legacy_cluster = ((str(entry.data.get("cluster_name", "")).lower() or None)
+                          if platform == "CLUSTER" else _entry_cluster_id(hass, entry))
+        context = (cluster_guest_identity_context(entry, entries, legacy_cluster)
+                   if platform == "CLUSTER" else guest_identity_context(entry, legacy_cluster)
+                   if platform == "PVE" else None)
+        if platform == "PVE" and context and context.use_scoped_identity:
+            matching_clusters = [candidate for candidate in entries
+                                 if candidate.data.get("platform_type") == "CLUSTER"
+                                 and entry_cluster_scope_id(candidate) == context.scope]
+            if matching_clusters and associated_cluster_for_pve(entry, entries) is None:
+                context = None
+        cluster = context.scope if context and context.use_scoped_identity else legacy_cluster
+        pve_identity_id = None
+        if platform == "PVE":
+            try:
+                pve_identity_id = pve_local_identity_context(entry, entries).identity_id
+            except PveLocalIdentityError:
+                pass
         normalized.append({"entry_id": entry.entry_id, "platform_type": platform,
                            "title": entry.title or platform, "node": entry.data.get("node") if platform == "PVE" else None,
                            "server_id": entry.data.get("server_id") if platform == "PBS" else None,
-                           "cluster_id": cluster})
+                           "cluster_id": cluster, "pve_identity_id": pve_identity_id})
         rows.extend(er.async_entries_for_config_entry(registry, entry.entry_id))
         if platform == "PVE":
             try:
-                for member in entries:
-                    if member.entry_id == entry.entry_id or (
+                members = [entry]
+                if context and context.use_scoped_identity:
+                    cluster_entry = associated_cluster_for_pve(entry, entries)
+                    if cluster_entry is not None:
+                        members = associated_pves_for_cluster(cluster_entry, entries)
+                else:
+                    members = [member for member in entries if member.entry_id == entry.entry_id or (
                         cluster and member.data.get("platform_type") == "PVE"
-                        and _entry_cluster_id(hass, member) == cluster
-                    ):
-                        for option in ("selected_vms", "selected_cts"):
-                            selection_guest_ids(get_entry_guest_selection(member, option))
+                        and _entry_cluster_id(hass, member) == cluster)]
+                for member in members:
+                    for option in ("selected_vms", "selected_cts"):
+                        selection_guest_ids(get_entry_guest_selection(member, option))
                 vms, cts = get_effective_guest_selections(hass, entry, cluster)
                 selections[entry.entry_id] = {"vm": selection_guest_ids(vms), "ct": selection_guest_ids(cts)}
             except (ValueError, TypeError):

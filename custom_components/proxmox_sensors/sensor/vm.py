@@ -10,19 +10,29 @@ from .base import ProxmoxBaseSensor
 from .replication import GuestReplicationMixin
 from ..const import DOMAIN
 from ..logic.guest_keys import make_guest_key
+from ..logic.guest_identity import guest_device_identifier, sensor_unique_id
+from ..logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    node_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ProxmoxVMSensor(GuestReplicationMixin, ProxmoxBaseSensor):
 
-    def __init__(self, coordinator, vm_id, node, label, guest_key=None, cluster_id=None):
+    def __init__(self, coordinator, vm_id, node, label, guest_key=None, cluster_id=None, identity_context=None):
         self._label = label
         self._vm_id = vm_id
         self._guest_key = guest_key or make_guest_key(node, vm_id)
         self._cluster_id = str(cluster_id).lower() if cluster_id else None
+        self._identity_context = identity_context
 
-        if self._cluster_id:
+        scoped = bool(identity_context and identity_context.use_scoped_identity)
+        if scoped:
+            uid = sensor_unique_id(identity_context.scope, "vm", vm_id)
+            id_scope = None
+        elif self._cluster_id:
             # Node-independent identity: survives live migrations.
             uid = f"proxmox_vm_{self._cluster_id}_{vm_id}_status_v1"
             id_scope = f"cluster_{self._cluster_id}"
@@ -31,7 +41,8 @@ class ProxmoxVMSensor(GuestReplicationMixin, ProxmoxBaseSensor):
             id_scope = None
 
         super().__init__(
-            coordinator, self._guest_key, None, None, uid, node, id_scope=id_scope
+            coordinator, self._guest_key, None, None, uid, node, id_scope=id_scope,
+            full_unique_id=uid if scoped else None,
         )
         self._attr_translation_key = "vm_status"
         self._attr_icon = "mdi:monitor"
@@ -40,8 +51,11 @@ class ProxmoxVMSensor(GuestReplicationMixin, ProxmoxBaseSensor):
     def device_info(self):
         node_id = self._node.lower()
         vmid = str(self._vm_id)
+        local_identity = coordinator_pve_local_identity_context(self.coordinator)
 
-        if self._cluster_id:
+        if self._identity_context and self._identity_context.use_scoped_identity:
+            identifiers = {(DOMAIN, guest_device_identifier(self._identity_context.scope, "vm", vmid))}
+        elif self._cluster_id:
             identifiers = {(DOMAIN, f"proxmox_vm_cluster_{self._cluster_id}_{vmid}_v1")}
         else:
             identifiers = {(DOMAIN, f"proxmox_vm_{node_id}_{vmid}_v1")}
@@ -56,7 +70,7 @@ class ProxmoxVMSensor(GuestReplicationMixin, ProxmoxBaseSensor):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(local_identity, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:
@@ -121,14 +135,20 @@ class ProxmoxVMAttributeSensor(ProxmoxBaseSensor):
         icon,
         guest_key=None,
         cluster_id=None,
+        identity_context=None,
     ):
         self._vm_id = vm_id
         self._label = label
         self._attr_key = attr_name
         self._guest_key = guest_key or make_guest_key(node, vm_id)
         self._cluster_id = str(cluster_id).lower() if cluster_id else None
+        self._identity_context = identity_context
 
-        if self._cluster_id:
+        scoped = bool(identity_context and identity_context.use_scoped_identity)
+        if scoped:
+            uid = sensor_unique_id(identity_context.scope, "vm", vm_id, attr_name.lower())
+            id_scope = None
+        elif self._cluster_id:
             uid = f"proxmox_vm_{self._cluster_id}_{vm_id}_{attr_name.lower()}_v1"
             id_scope = f"cluster_{self._cluster_id}"
         else:
@@ -136,7 +156,8 @@ class ProxmoxVMAttributeSensor(ProxmoxBaseSensor):
             id_scope = None
 
         super().__init__(
-            coordinator, self._guest_key, None, unit, uid, node, id_scope=id_scope
+            coordinator, self._guest_key, None, unit, uid, node, id_scope=id_scope,
+            full_unique_id=uid if scoped else None,
         )
         self._attr_translation_key = f"vm_{attr_name}"
         self._attr_icon = icon
@@ -147,8 +168,11 @@ class ProxmoxVMAttributeSensor(ProxmoxBaseSensor):
     def device_info(self):
         node_id = self._node.lower()
         vmid = str(self._vm_id)
+        local_identity = coordinator_pve_local_identity_context(self.coordinator)
 
-        if self._cluster_id:
+        if self._identity_context and self._identity_context.use_scoped_identity:
+            identifiers = {(DOMAIN, guest_device_identifier(self._identity_context.scope, "vm", vmid))}
+        elif self._cluster_id:
             identifiers = {(DOMAIN, f"proxmox_vm_cluster_{self._cluster_id}_{vmid}_v1")}
         else:
             identifiers = {(DOMAIN, f"proxmox_vm_{node_id}_{vmid}_v1")}
@@ -163,7 +187,7 @@ class ProxmoxVMAttributeSensor(ProxmoxBaseSensor):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(local_identity, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:

@@ -12,6 +12,8 @@ from .guest_selection import (
     _entry_cluster_id, get_effective_guest_selections, get_entry_guest_selection,
     selection_guest_ids,
 )
+from .cluster_scope import ACTIVE_SCOPE, associated_cluster_for_pve, cluster_scope_status, entry_cluster_scope_id
+from .pve_local_identity import node_device_identifier, pve_local_identity_context
 
 
 def setup_guest_migration_cleanup(hass, entry, coordinator):
@@ -23,6 +25,14 @@ def setup_guest_migration_cleanup(hass, entry, coordinator):
     scheduled = None
     closed = False
     source_node = str(entry.data.get(CONF_NODE, "")).lower()
+
+    def scoped_member(owner, scope):
+        entries = list(hass.config_entries.async_entries(DOMAIN))
+        return (
+            cluster_scope_status(owner) == ACTIVE_SCOPE
+            and entry_cluster_scope_id(owner) == scope
+            and associated_cluster_for_pve(owner, entries) is not None
+        )
 
     def runtime(owner):
         return hass.data.get(DOMAIN, {}).get(owner.entry_id, {}).get("coordinator")
@@ -40,13 +50,14 @@ def setup_guest_migration_cleanup(hass, entry, coordinator):
 
     def selected(cluster, kind, vmid):
         members = hass.config_entries.async_entries(DOMAIN)
-        if any(e.data.get(CONF_PLATFORM_TYPE) == "PVE"
-               and _entry_cluster_id(hass, e) is None for e in members):
+        scoped = scoped_member(entry, cluster)
+        if not scoped and any(e.data.get(CONF_PLATFORM_TYPE) == "PVE"
+                              and _entry_cluster_id(hass, e) is None for e in members):
             return None
         try:
             for owner in members:
-                if (owner.data.get(CONF_PLATFORM_TYPE) == "PVE"
-                        and _entry_cluster_id(hass, owner) == cluster):
+                member = scoped_member(owner, cluster) if scoped else _entry_cluster_id(hass, owner) == cluster
+                if owner.data.get(CONF_PLATFORM_TYPE) == "PVE" and member:
                     selection_guest_ids(get_entry_guest_selection(
                         owner, "selected_vms" if kind == "vm" else "selected_cts",
                     ))
@@ -58,13 +69,22 @@ def setup_guest_migration_cleanup(hass, entry, coordinator):
 
     def fresh(owner, cluster):
         current = runtime(owner)
+        member = scoped_member(owner, cluster) if scoped_member(entry, cluster) else _entry_cluster_id(hass, owner) == cluster
         return (current is not None and current.last_update_success
-                and _entry_cluster_id(hass, owner) == cluster
+                and member
                 and (current.data or {}).get("cluster_resources_ok") is True)
 
     def valid_device(device, owner, identifier):
+        local_identity = (getattr(runtime(owner), "pve_local_identity_context", None)
+                          or pve_local_identity_context(owner))
         parent = devices.async_get_device_by_identifier(
-            (DOMAIN, f"proxmox_node_{str(owner.data.get(CONF_NODE, '')).lower()}"),
+            (
+                DOMAIN,
+                node_device_identifier(
+                    local_identity,
+                    str(owner.data.get(CONF_NODE, "")).lower(),
+                ),
+            ),
             config_entry_id=owner.entry_id,
         )
         return (device is not None and device.config_entry_id == owner.entry_id
@@ -201,7 +221,8 @@ def setup_guest_migration_cleanup(hass, entry, coordinator):
             return
         targets = [owner for owner in hass.config_entries.async_entries(DOMAIN)
                    if owner.data.get(CONF_PLATFORM_TYPE) == "PVE"
-                   and _entry_cluster_id(hass, owner) == cluster
+                   and (scoped_member(owner, cluster) if scoped_member(entry, cluster)
+                        else _entry_cluster_id(hass, owner) == cluster)
                    and str(owner.data.get(CONF_NODE, "")).lower() == target_node]
         if len(targets) != 1:
             return

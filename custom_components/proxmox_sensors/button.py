@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import socket
 from homeassistant.components.button import ButtonEntity
 from homeassistant.core import callback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -24,10 +25,42 @@ from .logic.guest_selection import (
     get_effective_guest_selections,
     get_entry_guest_selection, selection_guest_ids, _entry_cluster_id,
 )
+from .logic.guest_identity import (
+    guest_button_unique_id,
+    guest_device_identifier,
+    resolve_legacy_guest_identity,
+)
+from .logic.cluster_scope import guest_identity_context, scoped_migration_target
+from .logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    local_entity_unique_id,
+    node_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 GRACE_CYCLES = 3
+
+
+def _legacy_guest_identity_resolver(hass, entry):
+    registry = er.async_get(hass)
+    devices = dr.async_get(hass)
+    rows = er.async_entries_for_config_entry(registry, entry.entry_id)
+    device_rows = dr.async_entries_for_config_entry(devices, entry.entry_id)
+    return lambda kind, vmid, node: resolve_legacy_guest_identity(
+        kind, vmid, node, rows, device_rows
+    )
+
+
+def _guest_identity_values(identity_context, resolver, kind, vmid, node):
+    if identity_context and identity_context.use_scoped_identity:
+        return node, None, False
+    identity = resolver(kind, vmid, node) if resolver else None
+    if identity and identity.ambiguous:
+        return node, None, True
+    return (identity.node if identity and identity.node else node,
+            identity.cluster_id if identity else None, False)
+
 
 _CT_COMMANDS = [
     ("start", "mdi:play"),
@@ -189,6 +222,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
         return
 
     cluster_id = resolve_cluster_id(hass, c_data)
+    identity_context = guest_identity_context(entry, cluster_id)
+    resolver_factory = globals().get("_legacy_guest_identity_resolver")
+    legacy_identity_resolver = resolver_factory(hass, entry) if resolver_factory else None
     effective_selected_vms, effective_selected_cts = get_effective_guest_selections(
         hass, entry, cluster_id, selected_vms, selected_cts
     )
@@ -197,9 +233,12 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if server_type == "PVE":
 
         device_registry = dr.async_get(hass)
+        local_identity = coordinator_pve_local_identity_context(coordinator)
         device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, f"proxmox_node_{node}")},
+            identifiers={(
+                DOMAIN, node_device_identifier(local_identity, node)
+            )},
             manufacturer="Proxmox",
             model="Proxmox Node",
             name=f"1. Node: {node}",
@@ -238,6 +277,11 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 if matches_selected_guest(
                     effective_selected_cts, ct_node, ct_id, ct_key
                 ):
+                    identity_node, identity_cluster, ambiguous = _guest_identity_values(
+                        identity_context, legacy_identity_resolver, "ct", ct_id, ct_node
+                    )
+                    if ambiguous:
+                        continue
                     label = ct_data.get("name", ct_id)
 
                     ct_commands = _CT_COMMANDS
@@ -248,12 +292,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
                                 coordinator,
                                 client,
                                 ct_id,
-                                ct_node,
+                                identity_node,
                                 label,
                                 cmd,
                                 icon,
                                 guest_key=ct_key,
-                                cluster_id=cluster_id,
+                                cluster_id=identity_cluster,
+                                identity_context=identity_context,
                             )
                         )
 
@@ -266,6 +311,11 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 if matches_selected_guest(
                     effective_selected_vms, vm_node, vm_id, vm_key
                 ):
+                    identity_node, identity_cluster, ambiguous = _guest_identity_values(
+                        identity_context, legacy_identity_resolver, "vm", vm_id, vm_node
+                    )
+                    if ambiguous:
+                        continue
                     label = vm_data.get("name", vm_id)
 
                     vm_commands = _VM_COMMANDS
@@ -276,12 +326,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
                                 coordinator,
                                 client,
                                 vm_id,
-                                vm_node,
+                                identity_node,
                                 label,
                                 cmd,
                                 icon,
                                 guest_key=vm_key,
-                                cluster_id=cluster_id,
+                                cluster_id=identity_cluster,
+                                identity_context=identity_context,
                             )
                         )
 
@@ -376,12 +427,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
             getattr(e, "_attr_unique_id", None)
             for e in entities
             if isinstance(e, (ProxmoxVMButton, ProxmoxContainerButton))
-            and not (cluster_id and getattr(e, "_cluster_id", None))
+            and not ((identity_context and identity_context.use_scoped_identity)
+                     or (cluster_id and getattr(e, "_cluster_id", None)))
         }
         known_button_ids.discard(None)
 
         initial_pending_groups = _group_existing_button_entities_by_guest(
-            entities, cluster_id
+            entities, cluster_id, identity_context
         )
 
         _setup_guest_button_reconciliation(
@@ -405,11 +457,12 @@ def _guest_identity_key(kind: str, cluster_id: str, vmid) -> str:
 
 
 def _build_guest_button_groups(
-    coordinator, client, c_data, node, selected_vms, selected_cts, features, cluster_id
+    coordinator, client, c_data, node, selected_vms, selected_cts, features, cluster_id,
+    identity_context, legacy_identity_resolver=None,
 ) -> dict:
 
     groups: dict = {}
-    if not cluster_id:
+    if not cluster_id and not (identity_context and identity_context.use_scoped_identity):
         return groups
 
     if features.get("enable_cts", True):
@@ -419,22 +472,31 @@ def _build_guest_button_groups(
             ct_node = ct_data.get("node", node)
             if not matches_selected_guest(selected_cts, ct_node, ct_id, ct_key):
                 continue
+            identity_node, identity_cluster, ambiguous = _guest_identity_values(
+                identity_context, legacy_identity_resolver, "ct", ct_id, ct_node
+            )
+            if ambiguous:
+                continue
             label = ct_data.get("name", ct_id)
             buttons = [
                 ProxmoxContainerButton(
                     coordinator,
                     client,
                     ct_id,
-                    ct_node,
+                    identity_node,
                     label,
                     cmd,
                     icon,
                     guest_key=ct_key,
-                    cluster_id=cluster_id,
+                    cluster_id=identity_cluster,
+                    identity_context=identity_context,
                 )
                 for cmd, icon in _CT_COMMANDS
             ]
-            groups[_guest_identity_key("ct", cluster_id, ct_id)] = buttons
+            scope = identity_context.scope if identity_context and identity_context.use_scoped_identity else (
+                identity_cluster or identity_node
+            )
+            groups[_guest_identity_key("ct", scope, ct_id)] = buttons
 
     if features.get("enable_vms", True):
         vm_map = c_data.get("vms", {})
@@ -443,35 +505,45 @@ def _build_guest_button_groups(
             vm_node = vm_data.get("node", node)
             if not matches_selected_guest(selected_vms, vm_node, vm_id, vm_key):
                 continue
+            identity_node, identity_cluster, ambiguous = _guest_identity_values(
+                identity_context, legacy_identity_resolver, "vm", vm_id, vm_node
+            )
+            if ambiguous:
+                continue
             label = vm_data.get("name", vm_id)
             buttons = [
                 ProxmoxVMButton(
                     coordinator,
                     client,
                     vm_id,
-                    vm_node,
+                    identity_node,
                     label,
                     cmd,
                     icon,
                     guest_key=vm_key,
-                    cluster_id=cluster_id,
+                    cluster_id=identity_cluster,
+                    identity_context=identity_context,
                 )
                 for cmd, icon in _VM_COMMANDS
             ]
-            groups[_guest_identity_key("vm", cluster_id, vm_id)] = buttons
+            scope = identity_context.scope if identity_context and identity_context.use_scoped_identity else (
+                identity_cluster or identity_node
+            )
+            groups[_guest_identity_key("vm", scope, vm_id)] = buttons
 
     return groups
 
 
-def _group_existing_button_entities_by_guest(entities, cluster_id) -> dict:
+def _group_existing_button_entities_by_guest(entities, cluster_id, identity_context=None) -> dict:
 
     groups: dict = {}
-    if not cluster_id:
+    scoped = bool(identity_context and identity_context.use_scoped_identity)
+    if not cluster_id and not scoped:
         return groups
 
     for e in entities:
-        e_cluster_id = getattr(e, "_cluster_id", None)
-        if not e_cluster_id:
+        scope = identity_context.scope if scoped else getattr(e, "_cluster_id", None)
+        if not scope:
             continue
         if isinstance(e, ProxmoxVMButton):
             kind = "vm"
@@ -479,7 +551,7 @@ def _group_existing_button_entities_by_guest(entities, cluster_id) -> dict:
             kind = "ct"
         else:
             continue
-        gkey = _guest_identity_key(kind, e_cluster_id, e._vmid)
+        gkey = _guest_identity_key(kind, scope, e._vmid)
         groups.setdefault(gkey, []).append(e)
 
     return groups
@@ -503,7 +575,6 @@ def _setup_guest_button_reconciliation(
     live_guest_instances: dict = {}
     missing_everywhere_counter: dict = {}
     deleting_groups: dict = {}
-
     async def _delete_excluded(entities, rows, registry):
         for entity in entities:
             if getattr(entity, "hass", None) is not None:
@@ -519,9 +590,12 @@ def _setup_guest_button_reconciliation(
     def _reconcile():
         c_data = coordinator.data or {}
         cluster_id = resolve_cluster_id(hass, c_data)
+        identity_context = guest_identity_context(entry, cluster_id)
         ent_reg = er.async_get(hass)
+        resolver_factory = globals().get("_legacy_guest_identity_resolver")
+        legacy_identity_resolver = resolver_factory(hass, entry) if resolver_factory else None
 
-        if not cluster_id:
+        if not cluster_id and not identity_context.use_scoped_identity:
             return
 
         effective_selected_vms, effective_selected_cts = get_effective_guest_selections(
@@ -536,6 +610,8 @@ def _setup_guest_button_reconciliation(
             effective_selected_cts,
             features,
             cluster_id,
+            identity_context,
+            legacy_identity_resolver,
         )
 
         for gkey, task in list(deleting_groups.items()):
@@ -618,6 +694,13 @@ def _setup_guest_button_reconciliation(
                 and located_node.lower() != node.lower()
                 and located_node.lower() in configured_pve_nodes
             ):
+                target_entry = None
+                if identity_context and identity_context.use_scoped_identity:
+                    target_entry = scoped_migration_target(
+                        entry, hass.config_entries.async_entries(DOMAIN), located_node
+                    )
+                    if target_entry is None:
+                        continue
                 _LOGGER.info(
                     "Guest buttons %s %s migrated from %s to %s; releasing "
                     "local instances via entity.async_remove(force_remove="
@@ -629,9 +712,9 @@ def _setup_guest_button_reconciliation(
                 )
                 entities_to_release = live_guest_instances.pop(gkey)
                 for entity_obj in entities_to_release:
-                    hass.async_create_task(
-                        entity_obj.async_remove(force_remove=False)
-                    )
+                    if getattr(entity_obj, "hass", None) is None:
+                        continue
+                    hass.async_create_task(entity_obj.async_remove(force_remove=False))
                 known_unique_ids.difference_update(
                     e._attr_unique_id for e in entities_to_release
                 )
@@ -956,14 +1039,20 @@ class PBSNodeBaseButton(CoordinatorEntity, ButtonEntity):
             )
 
             if result:
-                await asyncio.sleep(3)
-                await self.coordinator.async_request_refresh()
-                self.async_write_ha_state()
                 _LOGGER.info(
-                    "PBS node command %s executed successfully on %s",
+                    "PBS node command %s accepted on %s",
                     self._command_name,
                     self._server_id,
                 )
+                try:
+                    await asyncio.sleep(3)
+                    await self.coordinator.async_request_refresh()
+                    self.async_write_ha_state()
+                except Exception as refresh_error:
+                    _LOGGER.debug(
+                        "PBS status refresh after accepted %s on %s: %s",
+                        self._command_name, self._server_id, refresh_error,
+                    )
             else:
                 _LOGGER.error(
                     "PBS node command %s failed on %s",
@@ -1011,23 +1100,35 @@ class PBSWakeButton(PBSNodeBaseButton):
             "mdi:power-on",
         )
 
+    def _wol_mac(self):
+        mac = self.coordinator.config_entry.data.get("wol_mac")
+        if not isinstance(mac, str):
+            return None
+        mac = mac.strip()
+        if not re.fullmatch(r"(?:[0-9a-fA-F]{12}|[0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\1){4}[0-9a-fA-F]{2})", mac):
+            return None
+        compact = mac.replace(":", "").replace("-", "").lower()
+        if compact == "000000000000" or int(compact[:2], 16) & 1:
+            return None
+        return ":".join(compact[i:i + 2] for i in range(0, 12, 2))
+
+    @property
+    def available(self):
+        return self._wol_mac() is not None
+
     async def async_press(self):
         """Send WOL packet."""
         try:
-            entry = self.coordinator.config_entry
-            mac = entry.data.get("wol_mac")
+            mac = self._wol_mac()
 
             if not mac:
-                _LOGGER.error("No MAC configured for PBS %s", self._server_id)
+                _LOGGER.error("No valid MAC configured for PBS %s", self._server_id)
                 return
 
             _LOGGER.info("Sending WOL to PBS %s (%s)", self._server_id, mac)
 
-            await self.hass.services.async_call(
-                "wake_on_lan",
-                "send_magic_packet",
-                {"mac": mac},
-                blocking=True,
+            await self.hass.async_add_executor_job(
+                ProxmoxNodeButton._send_magic_packet, mac
             )
 
             persistent_notification.create(
@@ -1064,6 +1165,7 @@ class ProxmoxBaseButton(CoordinatorEntity, ButtonEntity):
         guest_type=None,
         guest_key=None,
         cluster_id=None,
+        identity_context=None,
     ):
         super().__init__(coordinator)
         self._client = client
@@ -1074,8 +1176,11 @@ class ProxmoxBaseButton(CoordinatorEntity, ButtonEntity):
         self._guest_type = guest_type
         self._guest_key = guest_key or make_guest_key(node, vmid)
         self._cluster_id = str(cluster_id).lower() if cluster_id else None
+        self._identity_context = identity_context
 
-        if self._cluster_id:
+        if identity_context and identity_context.use_scoped_identity:
+            self._attr_unique_id = guest_button_unique_id(identity_context.scope, guest_type or "guest", vmid, command)
+        elif self._cluster_id:
             # Node-independent identity: survives live migrations, mirrors
             # the scheme used by sensor/vm.py and sensor/ct.py.
             self._attr_unique_id = (
@@ -1179,6 +1284,7 @@ class ProxmoxVMButton(ProxmoxBaseButton):
         icon,
         guest_key=None,
         cluster_id=None,
+        identity_context=None,
     ):
         super().__init__(
             coordinator,
@@ -1191,14 +1297,18 @@ class ProxmoxVMButton(ProxmoxBaseButton):
             guest_type="vm",
             guest_key=guest_key,
             cluster_id=cluster_id,
+            identity_context=identity_context,
         )
 
     @property
     def device_info(self):
         node_id = self._node.lower()
         vmid = str(self._vmid)
+        local_identity = coordinator_pve_local_identity_context(self.coordinator)
 
-        if self._cluster_id:
+        if self._identity_context and self._identity_context.use_scoped_identity:
+            identifiers = {(DOMAIN, guest_device_identifier(self._identity_context.scope, "vm", vmid))}
+        elif self._cluster_id:
             identifiers = {(DOMAIN, f"proxmox_vm_cluster_{self._cluster_id}_{vmid}_v1")}
         else:
             identifiers = {(DOMAIN, f"proxmox_vm_{node_id}_{vmid}_v1")}
@@ -1213,7 +1323,7 @@ class ProxmoxVMButton(ProxmoxBaseButton):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(local_identity, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:
@@ -1237,6 +1347,7 @@ class ProxmoxContainerButton(ProxmoxBaseButton):
         icon,
         guest_key=None,
         cluster_id=None,
+        identity_context=None,
     ):
         super().__init__(
             coordinator,
@@ -1249,14 +1360,18 @@ class ProxmoxContainerButton(ProxmoxBaseButton):
             guest_type="ct",
             guest_key=guest_key,
             cluster_id=cluster_id,
+            identity_context=identity_context,
         )
 
     @property
     def device_info(self):
         node_id = self._node.lower()
         vmid = str(self._vmid)
+        local_identity = coordinator_pve_local_identity_context(self.coordinator)
 
-        if self._cluster_id:
+        if self._identity_context and self._identity_context.use_scoped_identity:
+            identifiers = {(DOMAIN, guest_device_identifier(self._identity_context.scope, "ct", vmid))}
+        elif self._cluster_id:
             identifiers = {(DOMAIN, f"proxmox_ct_cluster_{self._cluster_id}_{vmid}_v1")}
         else:
             identifiers = {(DOMAIN, f"proxmox_ct_{node_id}_{vmid}_v1")}
@@ -1271,7 +1386,7 @@ class ProxmoxContainerButton(ProxmoxBaseButton):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(local_identity, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:
@@ -1295,7 +1410,11 @@ class ProxmoxNodeButton(CoordinatorEntity, ButtonEntity):
         server_id = coordinator.config_entry.data.get("server_id", "default").lower()
         node_id = node.lower()
 
-        self._attr_unique_id = f"pve_{server_id}_node_{node_id}_{command}"
+        self._attr_unique_id = local_entity_unique_id(
+            coordinator_pve_local_identity_context(coordinator),
+            server_id,
+            f"node_{node_id}_{command}",
+        )
         self._attr_translation_key = f"node_{command}"
         self._attr_translation_placeholders = {"name": str(node)}
 
@@ -1304,7 +1423,13 @@ class ProxmoxNodeButton(CoordinatorEntity, ButtonEntity):
         node_id = self._node.lower()
 
         return {
-            "identifiers": {(DOMAIN, f"proxmox_node_{node_id}")},
+            "identifiers": {(
+                DOMAIN,
+                node_device_identifier(
+                    coordinator_pve_local_identity_context(self.coordinator),
+                    node_id,
+                ),
+            )},
             "manufacturer": "Proxmox",
             "model": "Proxmox Node",
             "name": f"1. Node: {self._node.capitalize()}",
@@ -1329,6 +1454,13 @@ class ProxmoxNodeButton(CoordinatorEntity, ButtonEntity):
             return self._wol_mac() is not None
         return super().available
 
+    @staticmethod
+    def _send_magic_packet(mac):
+        payload = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "")) * 16
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(payload, ("255.255.255.255", 9))
+
     async def async_press(self):
         if self._command == "wake":
             mac = self._wol_mac()
@@ -1336,9 +1468,7 @@ class ProxmoxNodeButton(CoordinatorEntity, ButtonEntity):
                 _LOGGER.error("Cannot send WOL to node %s: missing or invalid configured MAC", self._node)
                 return
             try:
-                await self.hass.services.async_call(
-                    "wake_on_lan", "send_magic_packet", {"mac": mac}, blocking=True,
-                )
+                await self.hass.async_add_executor_job(self._send_magic_packet, mac)
             except Exception as err:
                 _LOGGER.error("Error sending WOL to node %s: %s", self._node, err)
             else:

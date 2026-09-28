@@ -3,12 +3,19 @@
 from __future__ import annotations
 import logging
 import asyncio
+from .logic.cluster_scope import (
+    ACTIVE_SCOPE, CLUSTER_SCOPE_ID, CLUSTER_SCOPE_STATE, new_cluster_scope_id,
+    cluster_entry_scope_status, entry_cluster_scope_id, recoverable_pve_scopes,
+    recovery_registry_conflict,
+)
 import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.translation import async_get_translations
+from homeassistant.helpers import entity_registry as er, device_registry as dr
 
 from .api import (
     AuthenticationError,
@@ -33,13 +40,18 @@ from .pbs_identity import (
     async_server_id_for_pbs_identity,
     pbs_server_id_available_for_identity,
 )
+from .logic.pve_local_identity import (
+    LOCAL_IDENTITY_VERSION,
+    new_pve_identity_id,
+)
+from .const import PVE_IDENTITY_ID, PVE_LOCAL_IDENTITY_VERSION
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVER_TYPES = {
-    "PVE": "Proxmox VE",
-    "PBS": "Proxmox Backup Server",
-    "CLUSTER": "Proxmox Cluster",
+    "PVE": "PVE",
+    "PBS": "PBS",
+    "CLUSTER": "CLUSTER",
 }
 
 PVE_MIN_ENDPOINTS = ["nodes"]
@@ -76,6 +88,56 @@ def _next_pbs_server_id(entries, reserved_server_ids=()):
     return f"pbs_{max_index + 1}"
 
 
+def _normalized_config_host(value) -> str:
+    return str(value or "").strip().rstrip(".").lower()
+
+
+def _config_entry_platform(data) -> str:
+    return str(data.get(CONF_PLATFORM_TYPE) or data.get("server_type") or "").upper()
+
+
+def _config_entry_unique_id(data) -> str | None:
+    platform = _config_entry_platform(data)
+    host = _normalized_config_host(data.get(CONF_HOST))
+    if not host:
+        return None
+    if platform == "PVE":
+        node = str(data.get(CONF_NODE) or "").strip().lower()
+        return f"pve:{host}:{node}" if node else None
+    if platform == "PBS":
+        instance_id = str(data.get("pbs_instance_id") or "").strip()
+        return f"pbs:instance:{instance_id}" if instance_id else f"pbs:endpoint:{host}"
+    if platform == "CLUSTER":
+        return f"cluster:endpoint:{host}"
+    return None
+
+
+def _equivalent_config_entry(data, entries) -> bool:
+    platform = _config_entry_platform(data)
+    host = _normalized_config_host(data.get(CONF_HOST))
+    node = str(data.get(CONF_NODE) or "").strip().lower()
+    instance_id = str(data.get("pbs_instance_id") or "").strip()
+    for entry in entries:
+        existing = getattr(entry, "data", {}) or {}
+        if _config_entry_platform(existing) != platform:
+            continue
+        existing_host = _normalized_config_host(existing.get(CONF_HOST))
+        if platform == "PVE":
+            existing_node = str(existing.get(CONF_NODE) or "").strip().lower()
+            if host and node and host == existing_host and node == existing_node:
+                return True
+        elif platform == "PBS":
+            existing_instance = str(existing.get("pbs_instance_id") or "").strip()
+            if instance_id and existing_instance:
+                if instance_id == existing_instance:
+                    return True
+            elif host and host == existing_host:
+                return True
+        elif platform == "CLUSTER" and host and host == existing_host:
+            return True
+    return False
+
+
 class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 3
@@ -83,6 +145,18 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self):
         self._config = {}
         self._use_token = False
+
+    async def _check_config_entry_identity(self):
+        unique_id = _config_entry_unique_id(self._config)
+        if unique_id is None:
+            return None
+        await self.async_set_unique_id(unique_id)
+        self._abort_if_unique_id_configured()
+        if _equivalent_config_entry(
+            self._config, self.hass.config_entries.async_entries(DOMAIN)
+        ):
+            return self.async_abort(reason="already_configured")
+        return None
 
     # ===== STEP 1 — SERVER TYPE + HOST ======================
 
@@ -98,11 +172,27 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required(CONF_HOST): str,
                     vol.Required(CONF_PLATFORM_TYPE, default="PVE"): vol.In(
-                        SERVER_TYPES
+                        await self._server_type_labels()
                     ),
                 }
             ),
         )
+
+    async def _server_type_labels(self):
+        language = (getattr(self, "context", None) or {}).get("language") or getattr(
+            getattr(self.hass, "config", None), "language", "en"
+        )
+        translations = await async_get_translations(
+            self.hass, language, "component", {DOMAIN}
+        )
+        english = translations if language == "en" else await async_get_translations(
+            self.hass, "en", "component", {DOMAIN}
+        )
+        return {
+            value: translations.get(key) or english.get(key) or value
+            for value in SERVER_TYPES
+            for key in (f"component.{DOMAIN}.selector.platform_type.options.{value.lower()}",)
+        }
 
     # ===== STEP 2 — AUTH METHOD ==============================
 
@@ -142,7 +232,6 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             schema_dict[vol.Required(CONF_PASSWORD)] = str
 
         schema_dict[vol.Optional("auto_detect_node", default=True)] = bool
-        schema_dict[vol.Optional("enable_lm_sensors", default=True)] = bool
         schema_dict[vol.Optional(CONF_VERIFY_SSL, default=False)] = bool
 
         if user_input is not None:
@@ -478,6 +567,9 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._config["enable_physical_disks"] = user_input.get(
                 "enable_physical_disks", True
             )
+            self._config["enable_lm_sensors"] = user_input.get(
+                "enable_lm_sensors", True
+            )
             self._config["enable_node_controls"] = user_input.get(
                 "enable_node_controls", False
             )
@@ -543,6 +635,7 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             st_options
                         ),
                         vol.Optional("enable_physical_disks", default=True): bool,
+                        vol.Optional("enable_lm_sensors", default=True): bool,
                         vol.Optional("enable_node_controls", default=False): bool,
                     }
                 ),
@@ -554,12 +647,136 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     # ===== FINAL STEP ==========
 
+    def _recovery_candidates(self):
+        entries = tuple(self.hass.config_entries.async_entries(DOMAIN))
+        groups = recoverable_pve_scopes(entries)
+        if not groups:
+            return {}
+        try:
+            rows = tuple(er.async_get(self.hass).entities.values())
+            devices = tuple(dr.async_get(self.hass).devices.values())
+        except Exception:
+            _LOGGER.exception("Unable to inspect registries for CLUSTER recovery")
+            return {}
+        return {
+            scope: members for scope, members in groups.items()
+            if not recovery_registry_conflict(scope, members, rows, devices)
+        }
+
+    async def async_step_cluster_association(self, user_input=None):
+        return self.async_show_menu(
+            step_id="cluster_association",
+            menu_options=["new_cluster_association", "recover_cluster_scope"],
+        )
+
+    async def async_step_new_cluster_association(self, user_input=None):
+        self._cluster_association_choice = "new"
+        return await self._finish()
+
+    async def async_step_recover_cluster_scope(self, user_input=None):
+        candidates = self._recovery_candidates()
+        errors = {}
+        if user_input is not None:
+            scope = user_input.get("scope")
+            offered = getattr(self, "_offered_recovery", {})
+            if scope in candidates and candidates[scope] == offered.get(scope):
+                self._selected_recovery = (scope, candidates[scope])
+                return await self.async_step_confirm_cluster_recovery()
+            errors["base"] = "recovery_unavailable"
+        self._offered_recovery = dict(candidates)
+        entries = {entry.entry_id: entry for entry in self.hass.config_entries.async_entries(DOMAIN)}
+        choices = {
+            scope: ", ".join(
+                f"{entries[entry_id].title} ({entries[entry_id].data.get(CONF_HOST, '?')}; {entry_id})"
+                for entry_id in members
+            )
+            for scope, members in candidates.items()
+        }
+        return self.async_show_form(
+            step_id="recover_cluster_scope",
+            data_schema=vol.Schema({vol.Required("scope"): vol.In(choices)}),
+            errors=errors,
+        )
+
+    async def async_step_confirm_cluster_recovery(self, user_input=None):
+        selection = getattr(self, "_selected_recovery", None)
+        if selection is None:
+            return await self.async_step_recover_cluster_scope()
+        scope, members = selection
+        if user_input is not None:
+            if not user_input.get("confirm", False):
+                self._selected_recovery = None
+                return await self.async_step_cluster_association()
+            if self._recovery_candidates().get(scope) != members:
+                self._selected_recovery = None
+                return await self.async_step_recover_cluster_scope({"scope": scope})
+            self._cluster_association_choice = "recover"
+            return await self._finish()
+        entries = {entry.entry_id: entry for entry in self.hass.config_entries.async_entries(DOMAIN)}
+        return self.async_show_form(
+            step_id="confirm_cluster_recovery",
+            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+            description_placeholders={
+                "pves": ", ".join(f"{entries[entry_id].title} ({entry_id})" for entry_id in members),
+            },
+        )
+
+    def _eligible_clusters(self):
+        clusters = [entry for entry in self.hass.config_entries.async_entries(DOMAIN)
+                    if entry.data.get(CONF_PLATFORM_TYPE) == "CLUSTER"]
+        return {
+            entry.entry_id: entry for entry in clusters
+            if cluster_entry_scope_status(entry) == ACTIVE_SCOPE
+            and sum(entry_cluster_scope_id(other) == entry_cluster_scope_id(entry)
+                    for other in clusters) == 1
+        }
+
+    async def async_step_pve_membership(self, user_input=None):
+        return self.async_show_menu(
+            step_id="pve_membership",
+            menu_options=(["join_cluster", "independent"]
+                          if self._eligible_clusters() else ["independent"]),
+        )
+
+    async def async_step_join_cluster(self, user_input=None):
+        clusters = self._eligible_clusters()
+        errors = {}
+        if user_input is not None:
+            target_id = user_input.get("cluster")
+            target = clusters.get(target_id)
+            expected = getattr(self, "_offered_clusters", {}).get(target_id)
+            if target is not None and expected == entry_cluster_scope_id(target):
+                self._membership_choice = target_id
+                self._membership_scope = expected
+                return await self._finish()
+            errors["base"] = "cluster_unavailable"
+        self._offered_clusters = {
+            entry_id: entry_cluster_scope_id(entry) for entry_id, entry in clusters.items()
+        }
+        choices = {
+            entry.entry_id: f"{index}. {entry.title} ({entry.data.get(CONF_HOST, '')})"
+            for index, entry in enumerate(sorted(clusters.values(), key=lambda entry: entry.entry_id), 1)
+        }
+        return self.async_show_form(
+            step_id="join_cluster",
+            data_schema=vol.Schema({vol.Required("cluster"): vol.In(choices)}),
+            errors=errors,
+        )
+
+    async def async_step_independent(self, user_input=None):
+        self._membership_choice = "independent"
+        return await self._finish()
+
     async def _finish(self):
 
         server_type = self._config.get(CONF_PLATFORM_TYPE, "PVE")
 
         if CONF_NODE not in self._config:
             self._config[CONF_NODE] = "Proxmox"
+
+        duplicate = await self._check_config_entry_identity()
+        if duplicate is not None:
+            return duplicate
 
         title_name = None
 
@@ -615,6 +832,16 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # ============ CLUSTER =================
         elif server_type == "CLUSTER":
+            candidates = self._recovery_candidates()
+            choice = getattr(self, "_cluster_association_choice", None)
+            if candidates and choice is None:
+                return await self.async_step_cluster_association()
+            if choice == "recover":
+                selection = getattr(self, "_selected_recovery", None)
+                if selection is None or self._recovery_candidates().get(selection[0]) != selection[1]:
+                    self._cluster_association_choice = None
+                    self._selected_recovery = None
+                    return await self.async_step_recover_cluster_scope({"scope": None})
             self._config["server_id"] = f"cluster_{self._config[CONF_HOST]}"
 
             try:
@@ -641,12 +868,54 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not title_name:
                 title_name = self._config.get(CONF_HOST)
 
+
         # ========== PVE =================
         else:
+            choice = getattr(self, "_membership_choice", None)
+            if choice is None:
+                return await self.async_step_pve_membership()
+            if choice == "independent":
+                if CLUSTER_SCOPE_ID not in self._config:
+                    self._config[CLUSTER_SCOPE_ID] = new_cluster_scope_id()
+            else:
+                target = self._eligible_clusters().get(choice)
+                if target is None or entry_cluster_scope_id(target) != self._membership_scope:
+                    return await self.async_step_join_cluster({"cluster": choice})
+                self._config[CLUSTER_SCOPE_ID] = self._membership_scope
             self._config["server_id"] = self._config[CONF_NODE]
+            self._config[CLUSTER_SCOPE_STATE] = ACTIVE_SCOPE
+            if PVE_LOCAL_IDENTITY_VERSION not in self._config:
+                self._config[PVE_LOCAL_IDENTITY_VERSION] = LOCAL_IDENTITY_VERSION
+                self._config[PVE_IDENTITY_ID] = new_pve_identity_id(
+                    self.hass.config_entries.async_entries(DOMAIN)
+                )
             title_name = self._config.get(CONF_NODE)
 
         # ======== FINAL =================
+        duplicate = await self._check_config_entry_identity()
+        if duplicate is not None:
+            return duplicate
+        if server_type == "CLUSTER":
+            if choice == "recover":
+                selection = getattr(self, "_selected_recovery", None)
+                if selection is None or self._recovery_candidates().get(selection[0]) != selection[1]:
+                    self._cluster_association_choice = None
+                    self._selected_recovery = None
+                    return await self.async_step_recover_cluster_scope({"scope": None})
+                self._config[CLUSTER_SCOPE_ID] = selection[0]
+            elif CLUSTER_SCOPE_ID not in self._config:
+                reserved = {
+                    entry_cluster_scope_id(entry)
+                    for entry in self.hass.config_entries.async_entries(DOMAIN)
+                }
+                for _ in range(16):
+                    scope = new_cluster_scope_id()
+                    if scope not in reserved:
+                        self._config[CLUSTER_SCOPE_ID] = scope
+                        break
+                else:
+                    return self.async_abort(reason="scope_unavailable")
+            self._config[CLUSTER_SCOPE_STATE] = ACTIVE_SCOPE
         title = f"{server_type}: {title_name}"
         return self.async_create_entry(title=title, data=self._config)
 

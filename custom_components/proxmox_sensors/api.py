@@ -5,11 +5,8 @@ import asyncio
 import logging
 import requests
 import time
-import urllib3
 from urllib.parse import urlencode
 from proxmoxer import ProxmoxAPI
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -615,6 +612,10 @@ class ProxmoxClient:
                     timeout=15,
                 )
 
+            if method == "GET" and path == "nodes/localhost/identity" and r.status_code == 404:
+                LOGGER.debug("PBS instance identity endpoint unavailable on %s", clean_host)
+                return None
+
             if raise_errors and r.status_code >= 400:
                 _raise_for_auth_or_permission(r.status_code, path)
                 raise CannotConnect(
@@ -826,8 +827,13 @@ class ProxmoxClient:
             path = f"nodes/{node}/status"
             data = {"command": command}
 
-            result = await self.pbs_post(hass, path, data)
-            return result is not None
+            await hass.async_add_executor_job(
+                self._pbs_request, "POST", path, data, True
+            )
+            return True
         except Exception as e:
-            LOGGER.error("Error executing PBS node command %s: %s", command, e)
+            LOGGER.error(
+                "Error executing PBS node command %s on %s: %s: %s",
+                command, node, type(e).__name__, e,
+            )
             return False

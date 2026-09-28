@@ -2,11 +2,12 @@
 
 import logging
 import asyncio
+import requests
 from datetime import timedelta, datetime, timezone
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, CONF_NODE, CONF_PLATFORM_TYPE
-from .api import PermissionError as ProxmoxPermissionError
+from .api import AuthenticationError, CannotConnect, PermissionError as ProxmoxPermissionError
 from .logic.guest_keys import (
     find_guest_node_in_resources,
     make_guest_key,
@@ -19,6 +20,28 @@ from .logic.guest_selection import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def is_pbs_temporary_unavailable(error):
+    while error is not None:
+        if isinstance(error, (TimeoutError, requests.exceptions.Timeout)):
+            return True
+        if isinstance(error, CannotConnect):
+            cause = error.__cause__
+            if isinstance(cause, (requests.exceptions.ConnectionError, OSError)) and not isinstance(
+                cause, requests.exceptions.SSLError
+            ):
+                return True
+        error = error.__cause__
+    return False
+
+
+def is_pbs_configuration_error(error):
+    while error is not None:
+        if isinstance(error, (AuthenticationError, ProxmoxPermissionError)):
+            return True
+        error = error.__cause__
+    return False
 
 
 def _normalize_api_dict(payload):
@@ -52,122 +75,52 @@ def _to_iso_timestamp(value):
         return None
 
 
-def _build_backup_jobs_payload(jobs, tasks):
-    """Build a safe backup-jobs summary from cluster jobs and recent vzdump tasks."""
-    if not isinstance(jobs, list):
-        jobs = []
+def _build_backup_jobs_payload(
+    jobs,
+    tasks,
+    *,
+    jobs_available=True,
+    tasks_available=True,
+):
+    """Build an authoritative cluster backup summary."""
+    current_jobs = jobs if jobs_available and isinstance(jobs, list) else None
+    current_tasks = tasks if tasks_available and isinstance(tasks, list) else None
 
-    if not isinstance(tasks, list):
-        tasks = []
+    completed_tasks = []
+    if current_tasks is not None:
+        completed_tasks = [
+            task
+            for task in current_tasks
+            if isinstance(task, dict)
+            and task.get("type") == "vzdump"
+            and task.get("endtime") not in (None, "")
+        ]
+
+    statuses = [
+        task.get("status")
+        for task in completed_tasks
+        if task.get("status") not in (None, "")
+    ]
+    if any(str(status).lower() != "ok" for status in statuses):
+        state = "error"
+    elif statuses:
+        state = "ok"
     else:
-        tasks = sorted(
-            tasks,
-            key=lambda x: x.get("endtime") or x.get("starttime") or 0,
-            reverse=True,
-        )[:20]
+        state = "unknown"
 
-    latest_task = None
-    latest_task_time = 0
-
-    for task in tasks:
-        if not isinstance(task, dict):
+    endtimes = []
+    for task in completed_tasks:
+        try:
+            endtimes.append(float(task["endtime"]))
+        except (KeyError, TypeError, ValueError):
             continue
-
-        upid = task.get("upid", "")
-        if "vzdump" not in upid:
-            continue
-
-        task_time = task.get("endtime") or task.get("starttime") or 0
-
-        if task_time >= latest_task_time:
-            latest_task = task
-            latest_task_time = task_time
-
-    normalized_jobs = []
-    failed_jobs = 0
-    last_run_ts = None
-    recent_failed_ts = None
-    now_ts = datetime.now(tz=timezone.utc).timestamp()
-
-    for index, job in enumerate(jobs):
-        if not isinstance(job, dict):
-            continue
-
-        matched_task = latest_task or {}
-
-        starttime = matched_task.get("starttime")
-        endtime = matched_task.get("endtime")
-        run_ts = endtime or starttime
-
-        duration = None
-        if starttime is not None and endtime is not None:
-            try:
-                duration = max(int(endtime - starttime), 0)
-            except (TypeError, ValueError):
-                duration = None
-
-        raw_status = matched_task.get("status")
-        if isinstance(raw_status, str) and raw_status.lower() == "ok":
-            last_status = "OK"
-        elif raw_status:
-            last_status = "error"
-        else:
-            last_status = "unknown"
-
-        if last_status == "error":
-            failed_jobs += 1
-            if run_ts is not None and (
-                recent_failed_ts is None or run_ts > recent_failed_ts
-            ):
-                recent_failed_ts = run_ts
-
-        if run_ts is not None and (last_run_ts is None or run_ts > last_run_ts):
-            last_run_ts = run_ts
-
-        job_id = (
-            job.get("id")
-            or job.get("vmid")
-            or job.get("job_id")
-            or f"backup_job_{index}"
-        )
-
-        normalized_jobs.append(
-            {
-                "id": str(job_id),
-                "node": job.get("node") or "cluster",
-                "storage": job.get("storage") or job.get("dumpdir") or "unknown",
-                "schedule": job.get("schedule") or "unknown",
-                "last_status": last_status,
-                "last_run": _to_iso_timestamp(run_ts),
-                "duration": duration,
-            }
-        )
-
-    state = "unknown"
-    if normalized_jobs:
-        if failed_jobs == 0 and all(
-            job["last_status"] == "OK" for job in normalized_jobs
-        ):
-            state = "ok"
-        elif failed_jobs > 1:
-            state = "error"
-        elif (
-            failed_jobs == 1
-            and recent_failed_ts is not None
-            and (now_ts - recent_failed_ts) <= 86400
-        ):
-            state = "error"
-        elif failed_jobs >= 1:
-            state = "warning"
-        else:
-            state = "unknown"
 
     return {
         "state": state,
-        "total_jobs": len(normalized_jobs),
-        "failed_jobs": failed_jobs,
-        "last_run": _to_iso_timestamp(last_run_ts),
-        "jobs": normalized_jobs,
+        "total_jobs": len(current_jobs) if current_jobs is not None else None,
+        "last_task_run": _to_iso_timestamp(max(endtimes)) if endtimes else None,
+        "jobs_available": current_jobs is not None,
+        "tasks_available": current_tasks is not None,
     }
 
 
@@ -315,10 +268,8 @@ async def create_proxmox_coordinator(hass, entry, client):
         try:
             value = await limited_task(coro_func, *args, True)
         except Exception as err:
-            if type(err).__name__ in (
-                "AuthenticationError",
-                "PermissionError",
-            ) and key not in _last_good_pbs:
+            if (isinstance(err, (AuthenticationError, ProxmoxPermissionError))
+                    or is_pbs_temporary_unavailable(err)):
                 raise
 
             _LOGGER.warning("PBS: Failed to fetch %s: %s", section, err)
@@ -444,6 +395,9 @@ async def create_proxmox_coordinator(hass, entry, client):
                                 client.get_pbs_datastores, hass, True
                             )
                         except Exception as err:
+                            if (isinstance(err, (AuthenticationError, ProxmoxPermissionError))
+                                    or is_pbs_temporary_unavailable(err)):
+                                raise
                             _LOGGER.warning(
                                 "PBS: Failed to fetch %s: %s",
                                 "pbs_datastore_names",
@@ -693,7 +647,6 @@ async def create_proxmox_coordinator(hass, entry, client):
                     result["cluster_id"] = cluster_id or _last_good_cluster_section(
                         "cluster_id", None
                     )
-
                     (
                         effective_selected_vms,
                         effective_selected_cts,
@@ -1079,6 +1032,11 @@ async def create_proxmox_coordinator(hass, entry, client):
                     return result
 
         except Exception as err:
+            if server_type == "PBS":
+                if is_pbs_temporary_unavailable(err):
+                    raise UpdateFailed(f"PBS temporarily unavailable: {err}") from err
+                _LOGGER.exception("Coordinator update failure")
+                raise UpdateFailed(f"Update error: {err}") from err
             _LOGGER.exception("Coordinator update failure")
             raise UpdateFailed(f"Update error: {err}")
 
@@ -1265,6 +1223,8 @@ async def create_cluster_coordinator(hass, entry, client):
                 result["backup_jobs"] = _build_backup_jobs_payload(
                     backup_jobs_raw,
                     result["cluster_tasks"],
+                    jobs_available=isinstance(backup_jobs, list),
+                    tasks_available=isinstance(backup_tasks, list),
                 )
 
         except Exception as err:

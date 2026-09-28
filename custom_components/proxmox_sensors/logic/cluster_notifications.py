@@ -17,13 +17,7 @@ def _normalize_notify_key(key):
 
 
 def parse_notify_string(notify_value):
-    """Parse a Proxmox ``notify`` string into a normalized dictionary.
-
-    Proxmox exposes notification settings as a compact string with key/value
-    pairs such as ``"package-updates=always,target-package-updates=gotify1"``.
-    This helper accepts either the raw string or an already parsed mapping and
-    returns a dictionary with snake_case keys.
-    """
+    """Normalize a Proxmox notification setting."""
     if not notify_value:
         return {}
 

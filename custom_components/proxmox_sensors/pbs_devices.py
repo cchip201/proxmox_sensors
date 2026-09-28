@@ -39,6 +39,24 @@ def pbs_parent_device(coordinator):
     return device.id if device else None
 
 
+def known_pbs_inventory(hass, entry):
+    from homeassistant.helpers import device_registry as dr
+
+    devices = dr.async_get(hass)
+    server_id = entry.data["server_id"].lower()
+    parent = devices.async_get_device_by_identifier(
+        (DOMAIN, f"pbs_server_{server_id}"), config_entry_id=entry.entry_id,
+    )
+    stores = set()
+    for device in dr.async_entries_for_config_entry(devices, entry.entry_id):
+        for domain, identifier in device.identifiers:
+            if domain == DOMAIN and identifier.startswith("pbs_datastore:"):
+                store = pbs_device_datastore(identifier, server_id)
+                if store:
+                    stores.add(store)
+    return parent is not None, sorted(stores)
+
+
 def reconcile_pbs_devices(hass, entry, datastores):
     """Keep exclusive device IDs; split shared devices by entity entry ownership.
 

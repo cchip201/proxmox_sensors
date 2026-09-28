@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from ..const import CONF_PLATFORM_TYPE, DOMAIN
 from .guest_keys import matches_selected_guest
+from .cluster_scope import (
+    ACTIVE_SCOPE,
+    LEGACY_SCOPE,
+    associated_cluster_for_pve,
+    cluster_scope_membership,
+    cluster_scope_status,
+)
 
 EFFECTIVE_SELECTED_VMS = "_effective_selected_vms"
 EFFECTIVE_SELECTED_CTS = "_effective_selected_cts"
@@ -65,6 +72,21 @@ def _entry_cluster_id(hass, entry):
     return persisted or parent_cluster
 
 
+def _selection_membership_key(hass, entry):
+    """Return an explicit scope, or the legacy name-only compatibility key.
+
+    Scope membership is never inferred.  Only entries with no scope field at
+    all retain the pre-scope cluster-name behavior among other legacy entries.
+    """
+    scope = cluster_scope_membership(entry)
+    if scope is not None:
+        return scope
+    if cluster_scope_status(entry) != LEGACY_SCOPE:
+        return None
+    cluster = _entry_cluster_id(hass, entry)
+    return ("legacy", _normalize_cluster_id(cluster)) if cluster else None
+
+
 def get_effective_guest_selections(
     hass,
     entry,
@@ -76,8 +98,8 @@ def get_effective_guest_selections(
     selected_vms = get_entry_guest_selection(entry, "selected_vms", selected_vms)
     selected_cts = get_entry_guest_selection(entry, "selected_cts", selected_cts)
 
-    normalized_cluster_id = _normalize_cluster_id(cluster_id)
-    if not normalized_cluster_id:
+    membership = _selection_membership_key(hass, entry)
+    if membership is None:
         return selected_vms, selected_cts
 
     effective_selected_vms = selected_vms
@@ -89,7 +111,7 @@ def get_effective_guest_selections(
             continue
         if other_entry.data.get(CONF_PLATFORM_TYPE) != "PVE":
             continue
-        if _entry_cluster_id(hass, other_entry) != normalized_cluster_id:
+        if _selection_membership_key(hass, other_entry) != membership:
             continue
 
         effective_selected_vms = _merge_guest_selection(
@@ -106,12 +128,12 @@ def get_effective_guest_selections(
 
 def guest_selection_entries(hass, entry):
     """Use exactly the same membership evidence as the effective selection."""
-    cluster_id = _entry_cluster_id(hass, entry)
+    membership = _selection_membership_key(hass, entry)
     return [entry] + [
         other for other in hass.config_entries.async_entries(DOMAIN)
-        if cluster_id and other.entry_id != entry.entry_id
+        if membership and other.entry_id != entry.entry_id
         and other.data.get(CONF_PLATFORM_TYPE) == "PVE"
-        and _entry_cluster_id(hass, other) == cluster_id
+        and _selection_membership_key(hass, other) == membership
     ]
 
 
@@ -165,7 +187,17 @@ def get_cycle_guest_selections(
     cluster_id,
 ):
     """Return the effective selections stored by the coordinator for this cycle."""
-    if not _normalize_cluster_id(cluster_id):
+    membership = cluster_scope_membership(entry)
+    scoped_active = (
+        membership is not None
+        and membership[0] == ACTIVE_SCOPE
+        and associated_cluster_for_pve(
+            entry, hass.config_entries.async_entries(DOMAIN)
+        ) is not None
+    )
+    if membership is not None and membership[0] == ACTIVE_SCOPE and not scoped_active:
+        return selected_vms, selected_cts
+    if not _normalize_cluster_id(cluster_id) and not scoped_active:
         return selected_vms, selected_cts
 
     if (

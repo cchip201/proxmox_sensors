@@ -91,11 +91,19 @@ def classify_entity(row, entry, identifiers):
                     "key": resource_id(entry["entry_id"], entry.get("server_id"), "datastore", store)}
 
     node = (entry.get("node") or "").lower()
-    prefix = f"proxmox_storage_{node}_"
-    stores = [identifier[len(prefix):] for identifier in sorted(identifiers) if identifier.startswith(prefix)]
+    prefixes = [f"proxmox_storage_{node}_"]
+    if entry.get("pve_identity_id"):
+        prefixes.insert(0, f"proxmox_storage_{entry['pve_identity_id']}_{node}_")
+    stores = {
+        identifier[len(prefix):]
+        for identifier in identifiers
+        for prefix in prefixes
+        if identifier.startswith(prefix) and identifier != prefix
+    }
     if len(stores) == 1:
-        return {"family": "storages", "kind": "storage", "label": stores[0],
-                "key": resource_id(entry["entry_id"], "storage", stores[0])}
+        store = next(iter(stores))
+        return {"family": "storages", "kind": "storage", "label": store,
+                "key": resource_id(entry["entry_id"], "storage", store)}
 
     # Some hardware resources share the node device. Extract only known prefixes;
     # unknown variants remain separate instead of accidentally merging resources.

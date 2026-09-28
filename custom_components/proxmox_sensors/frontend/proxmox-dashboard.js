@@ -211,9 +211,18 @@ function guestName(resource) {
 function pveVersion(ref) {
   return `{% set v = ${expression(ref)} %}{{ (v.split('/')[1] if v is string and v.startswith('pve-manager/') else (v if v is not none else '—')) | e }}`;
 }
+const PVE_CLUSTER_HEADER_CSS = `ha-markdown-element > header > div:nth-of-type(2) { margin-left: auto; min-width: 110px;
+  flex-direction: column; align-items: center; gap: 6px; }
+  ha-markdown-element > header > div:nth-of-type(2) > span { color: #b7c2cc; }
+  ha-markdown-element > header > aside { margin-left: 0; }
+  @media (max-width: 600px) { ha-markdown-element > header > div:nth-of-type(2) { margin-left: 0; align-items: flex-start; } }`;
 function buildPveNodeHeader(group) {
   const refs = [...blockRefs(group, 'header'), ...blockRefs(group, 'node_health')].map(item => item.ref);
   const facts = [], selected = [];
+  const nodeRef = refs.find(ref => ref.metric === 'health' && !ref.attribute);
+  const cluster = nodeRef
+    ? `{% set cluster_status = state_attr(${JSON.stringify(nodeRef.entity_id)}, 'cluster_association_status') %}{% set cluster_name = state_attr(${JSON.stringify(nodeRef.entity_id)}, 'associated_cluster_name') %}{% set cluster_labels = {'independent':'Independent','legacy':'Legacy','pending':'Pending','invalid':'Invalid','incomplete':'Incomplete','cluster_inactive':'Inactive','ambiguous':'Ambiguous'} %}{{ (cluster_name if cluster_status == 'associated' and cluster_name else cluster_labels.get(cluster_status, '—')) | e }}`
+    : '—';
   for (const [metric, title] of [['uptime_seconds', 'Uptime'], ['kernel_version', 'Kernel'], ['pve_version', 'PVE'], ['health', 'Health'], ['status', 'Status']]) {
     const ref = (metric === 'kernel_version' && refs.find(item => item.metric === metric && !item.attribute))
       || refs.find(item => item.metric === metric);
@@ -225,7 +234,7 @@ function buildPveNodeHeader(group) {
     if (metric === 'status') display = statusValue(ref, true);
     facts.push(metric === 'status' ? display : `<div><span>${title}</span><strong>${display}</strong></div>`);
   }
-  return {...pveMarkdown(null, `<header><div><img src="/proxmox_sensors/dashboard/logo_small.png" alt="Proxmox Extended Sensors" width="56">${icon('mdi:server')}<strong>${text(group.node || group.entry_id)} · Proxmox VE</strong></div><aside>${facts.join('')}</aside></header>`, selected),
+  return {...pveMarkdown(null, `<header><div><img src="/proxmox_sensors/dashboard/logo_small.png" alt="Proxmox Extended Sensors" width="56">${icon('mdi:server')}<strong>${text(group.node || group.entry_id)} · Proxmox VE</strong></div><div><span>Cluster</span><strong>${cluster}</strong></div><aside>${facts.join('')}</aside></header>`, selected, 'mdi:information-outline', PVE_CLUSTER_HEADER_CSS),
     grid_options: {columns: 'full', rows: 'auto'}};
 }
 // Markdown admits anchors, but strips inline event handlers. Handle only our
@@ -337,7 +346,7 @@ function buildNodeInfoBlock(group) {
     ['node_info', 'node_network_tx', 'Network TX', 'mdi:upload-network'],
     ['node_health', 'iowait', 'I/O Wait', 'mdi:timer-sand'],
     ['node_info', 'ksm_status', 'KSM', 'mdi:memory'],
-    ['header', 'storage_count', 'Storages', 'mdi:database'],
+    ['node_info', 'storage_count', 'Storages', 'mdi:database'],
     ['tasks', 'node_last_task', 'Last Task', 'mdi:format-list-bulleted'],
   ];
   for (const [block, metric, title, glyph] of fields) {
@@ -446,7 +455,7 @@ function buildPbsHeader(group) {
     selected.push(ref);
     facts.push(`<div><span>${title}</span><strong>${value(ref)}</strong></div>`);
   }
-  return {...pveMarkdown(null, `<header><div><img src="/proxmox_sensors/dashboard/logo_int.png" alt="Proxmox Extended Sensors" width="56">${icon('mdi:backup-restore')}<strong>${text(group.server_id)} · Proxmox Backup Server</strong></div><aside>${facts.join('')}</aside></header>`, selected),
+  return {...pveMarkdown(null, `<header><div><img src="/proxmox_sensors/dashboard/logo_small.png" alt="Proxmox Extended Sensors" width="56">${icon('mdi:backup-restore')}<strong>${text(group.server_id)} · Proxmox Backup Server</strong></div><aside>${facts.join('')}</aside></header>`, selected),
     grid_options: {columns: 'full', rows: 'auto'}};
 }
 function pbsMetricCard(group, block, title, glyph, fields, extra = []) {
@@ -584,21 +593,24 @@ export function generateDashboard(payload, config = {}, basePath = null, hass = 
     const layout = payload.layouts[family];
     const model = payload.models[family];
     if (!layout || !model) continue;
-    const familySections = [];
     const groups = family === "pve" ? [...model.groups].sort((a, b) =>
       (a.node || a.entry_id || "").localeCompare(b.node || b.entry_id || "", undefined,
         {numeric: true, sensitivity: "base"})) : model.groups;
     for (const group of groups) {
       if (family === 'pbs') {
-        familySections.push(...buildPbsSections(group, opts));
+        const sections = buildPbsSections(group, opts);
+        views.push(darkView({title: group.server_id || TITLES[family], path: `pbs-${encodePathPart(group.entry_id)}`,
+          icon: ICONS[family], type: "sections", max_columns: 3, sections}));
         continue;
       }
       if (family === 'cluster') {
-        familySections.push(...buildClusterSections(group, hass));
+        const sections = buildClusterSections(group, hass);
+        views.push(darkView({title: group.cluster_id || TITLES[family], path: `cluster-${encodePathPart(group.entry_id)}`,
+          icon: ICONS[family], type: "sections", max_columns: 3, sections}));
         continue;
       }
-      const sections = family === "pve" ? [] : familySections;
-      const mainPath = family === "pve" ? nodeViewPath(group) : family;
+      const sections = [];
+      const mainPath = nodeViewPath(group);
       const groupTitle = group.node || group.server_id || group.cluster_id || group.entry_id;
       for (const block of layout.blocks) {
         // Only detail subviews use the layout renderer for PVE. Its main view
@@ -637,8 +649,6 @@ export function generateDashboard(payload, config = {}, basePath = null, hass = 
       }
       if (family === "pve") views.push(buildPveNodeView(group, opts, basePath));
     }
-    if (family !== "pve" && familySections.length) views.push(darkView({title: TITLES[family], path: family, icon: ICONS[family],
-      type: "sections", max_columns: 3, sections: familySections}));
   }
   // A valid native empty view provides feedback without inventing resource data.
   if (!views.length) views.push(darkView({title: "Proxmox", path: "proxmox", type: "sections", sections: [

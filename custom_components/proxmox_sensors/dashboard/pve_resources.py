@@ -83,6 +83,8 @@ def build_pve_dashboard_model(inventory, layout=None):
                 key = entity.get("translation_key")
                 if key in ("node_updates", "node_network_rx", "node_network_tx") and kind == "node":
                     add("node_info", resource, entity, key)
+                if key == "proxmox_storages" and kind == "node":
+                    add("node_info", resource, entity, "storage_count")
                 if key == "node_ksm_status" and kind == "node":
                     add("node_info", resource, entity, "ksm_status")
                     add("node_health", resource, entity, "ksm_status")

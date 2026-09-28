@@ -25,7 +25,6 @@
           "token_id": "ID do Token (sem utilizador@pve!)",
           "token_secret": "Segredo do Token",
           "auto_detect_node": "Detetar nó automaticamente pelo IP do host",
-          "enable_lm_sensors": "Ativar sensores de hardware e temperaturas",
           "enable_cluster": "Ativar monitorização de todo o cluster",
           "verify_ssl": "Verificar Certificado SSL"
         }
@@ -43,7 +42,7 @@
       },
       "credentials_cluster": {
         "title": "3. Credenciais de Acesso — Cluster Proxmox",
-        "description": "Introduza as credenciais para conectar ao cluster. Utiliza a mesma API que o PVE (porta 8006).",
+        "description": "Introduza as credenciais do CLUSTER (API PVE, porta 8006). Se existirem PVE sem CLUSTER associado, pode criar uma nova associação ou recuperar uma explicitamente.",
         "data": {
           "user": "Utilizador (ex. root@pam)",
           "password": "Palavra-passe",
@@ -52,11 +51,44 @@
           "verify_ssl": "Verificar Certificado SSL"
         }
       },
+      "cluster_association": {
+        "title": "Associação CLUSTER",
+        "description": "Crie uma nova associação ou recupere uma utilizada por PVE sem CLUSTER associado. O nome e o host nunca determinam a pertença.",
+        "menu_options": {
+          "new_cluster_association": "Criar nova associação",
+          "recover_cluster_scope": "Recuperar associação de PVE existentes"
+        }
+      },
+      "recover_cluster_scope": {
+        "title": "PVE sem CLUSTER associado",
+        "description": "Escolha o grupo de PVE que pertence a este CLUSTER físico. Um PVE Independent pode aparecer aqui; verifique todos os membros.",
+        "data": {"scope": "Grupo PVE"}
+      },
+      "confirm_cluster_recovery": {
+        "title": "Confirmar recuperação da associação CLUSTER",
+        "description": "Confirme que este CLUSTER físico inclui todos estes PVE: {pves}. A identidade existente será reutilizada.",
+        "data": {"confirm": "Recuperar esta associação"}
+      },
       "select_node": {
         "title": "4. Selecionar Nó",
         "description": "Selecione o nó Proxmox a monitorizar.",
         "data": {
           "node": "Nó"
+        }
+      },
+      "pve_membership": {
+        "title": "Associação do servidor",
+        "description": "Escolha se este servidor se junta a um cluster configurado ou é independente. Apenas os clusters disponíveis são apresentados.",
+        "menu_options": {
+          "join_cluster": "Juntar a um cluster configurado",
+          "independent": "Configurar um servidor ou cluster independente"
+        }
+      },
+      "join_cluster": {
+        "title": "Escolher um cluster",
+        "description": "Selecione o cluster ao qual este servidor pertence. Esta escolha determina quais nós podem partilhar entidades dos convidados.",
+        "data": {
+          "cluster": "Cluster"
         }
       },
       "select_resources": {
@@ -67,16 +99,21 @@
           "cts": "Contentores (LXC)",
           "storage": "Armazenamento",
           "enable_physical_disks": "Ativar monitorização de discos físicos",
+          "enable_lm_sensors": "Ativar sensores de hardware e temperaturas",
           "enable_node_controls": "Ativar controlos de energia do nó"
         }
       }
     },
     "error": {
+      "recovery_unavailable": "O grupo de PVE mudou ou a sua identidade está em conflito com o Registry. Escolha novamente; não foi criado nenhum CLUSTER.",
+      "cluster_unavailable": "O cluster selecionado já não está disponível para associação. Volte atrás ou selecione outro cluster.",
       "cannot_connect": "Erro de conexão. Verifique o endereço do servidor.",
       "invalid_auth": "Falha na autenticação. Verifique as credenciais ou permissões do token.",
+      "insufficient_permissions": "A conta não tem permissões suficientes para aceder aos recursos Proxmox necessários.",
       "unknown": "Erro inesperado. Verifique os logs do Home Assistant."
     },
     "abort": {
+      "scope_unavailable": "Não foi possível gerar uma associação CLUSTER livre. Tente novamente.",
       "no_nodes_visible": "No visible nodes were found. Check the account permissions and cluster configuration.",
       "already_configured": "Este nó já está configurado.",
       "no_data": "Nenhum dado do cluster recebido. Verifique a sua configuração.",
@@ -89,7 +126,14 @@
       "guest_selection_changed": "Guest selections changed in another Options flow. Reopen Options and try again.",
       "guest_inventory_changed": "The guest inventory changed. Reopen Options and try again.",
       "invalid_guest_selection": "Only guests shown for this node can be selected.",
-      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs."
+      "guest_selection_failed": "Guest selections could not be saved. Check the Home Assistant logs.",
+      "source_not_pve": "Only a PVE entry can associate a cluster scope.",
+      "source_scope_not_active": "This PVE entry needs an active explicit cluster scope.",
+      "target_not_cluster": "The selected entry is not a CLUSTER entry.",
+      "target_scope_invalid": "The selected CLUSTER entry has an invalid cluster scope.",
+      "target_scope_conflict": "The selected CLUSTER entry belongs to a different explicit scope.",
+      "scope_already_associated": "Another CLUSTER entry is already associated with this scope.",
+      "association_target_not_available": "The selected CLUSTER entry is no longer available."
     },
     "abort": {
       "pbs_no_options": "Este servidor PBS não tem opções configuráveis.",
@@ -115,7 +159,15 @@
           "enable_pbs_node_controls": "Ativar controlos de energia do nó PBS",
           "wol_mac": "Endereço MAC Wake-on-LAN",
           "verify_ssl": "Verificar Certificado SSL"
+          ,"cluster_scope_action": "Gerir identidade do cluster",
+          "cluster_association_action": "Cluster association: select an explicitly eligible CLUSTER entry"
         }
+      }, "scope_confirm": {"title": "Confirmar identidade do cluster", "description": "Guarda apenas o âmbito explícito. Não migra entidades nem dispositivos.", "data": {"confirm": "Confirmar alteração"}
+      },
+      "cluster_association_confirm": {
+        "title": "Confirm CLUSTER association",
+        "description": "Associate PVE {source} with CLUSTER {target} using scope {scope}. This does not change entities, devices, or selections.",
+        "data": {"confirm": "Confirm CLUSTER association"}
       }
     }
   },
@@ -646,6 +698,7 @@
       }
     }
   },
+  "selector": {"platform_type": {"options": {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "cluster": "Cluster Proxmox"}}, "cluster_scope_action": {"options": {"keep": "Manter associado ao cluster", "independent": "Independente — sem migração de entidades VM/LXC entre nós"}}},
   "services": {
     "create_vzdump_backup": {
       "name": "Proxmox: Iniciar backup",

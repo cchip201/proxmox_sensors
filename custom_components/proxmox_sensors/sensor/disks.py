@@ -6,6 +6,11 @@ from homeassistant.helpers import device_registry as dr
 
 from .base import ProxmoxBaseSensor
 from ..const import DOMAIN
+from ..logic.pve_local_identity import (
+    coordinator_pve_local_identity_context,
+    disks_group_identifier,
+    node_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,8 +44,11 @@ class ProxmoxDiskSensor(ProxmoxBaseSensor):
     @property
     def device_info(self):
         node_id = self._node.lower()
+        context = coordinator_pve_local_identity_context(self.coordinator)
         info = {
-            "identifiers": {(DOMAIN, f"proxmox_disks_group_{node_id}")},
+            "identifiers": {(
+                DOMAIN, disks_group_identifier(context, node_id)
+            )},
             "name": f"2. Disks: {self._node.capitalize()}",
             "manufacturer": "Proxmox",
             "model": "Physical Disks Storage",
@@ -49,7 +57,7 @@ class ProxmoxDiskSensor(ProxmoxBaseSensor):
         try:
             info["via_device_id"] = dr.async_get_device_id_by_identifier(
                 self.coordinator.hass,
-                (DOMAIN, f"proxmox_node_{node_id}"),
+                (DOMAIN, node_device_identifier(context, node_id)),
                 config_entry_id=self.coordinator.config_entry.entry_id,
             )
         except ValueError:

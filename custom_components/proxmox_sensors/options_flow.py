@@ -6,6 +6,8 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import selector
+from homeassistant.helpers.translation import async_get_translations
 
 from .const import (
     DOMAIN,
@@ -23,6 +25,11 @@ from .logic.guest_selection import (
     _entry_cluster_id, get_entry_guest_selection, get_effective_guest_selections,
     guest_selection_entries, selection_guest_ids, plan_guest_selection,
 )
+from .logic.cluster_scope import (
+    CLUSTER_SCOPE_ID, CLUSTER_SCOPE_STATE, PENDING_SCOPE, cluster_association_preflight,
+    cluster_scope_status, entry_cluster_scope_id, new_cluster_scope_id,
+)
+from .logic.cluster_scope import associated_cluster_for_pve
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +43,143 @@ class GuestSelectionError(ValueError):
 
 
 class ProxmoxOptionsFlow(config_entries.OptionsFlow):
+
+    async def _scope_labels(self):
+        language = (getattr(self, "context", None) or {}).get("language") or getattr(
+            getattr(self.hass, "config", None), "language", "en"
+        )
+        translations = await async_get_translations(
+            self.hass, language, "selector", {DOMAIN}
+        )
+        english = translations if language == "en" else await async_get_translations(
+            self.hass, "en", "selector", {DOMAIN}
+        )
+        prefix = f"component.{DOMAIN}.selector.cluster_scope_action.options."
+        return {
+            key: translations.get(prefix + key) or english.get(prefix + key) or key
+            for key in ("keep", "independent")
+        }
+
+
+    def _scope_validator(self):
+        return selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=list(self._scope_choices()),
+                translation_key="cluster_scope_action",
+            )
+        )
+
+    def _scope_choices(self):
+        """Return the normal PVE Options Flow cluster actions."""
+        entries = list(self.hass.config_entries.async_entries(DOMAIN))
+        cluster = associated_cluster_for_pve(self.config_entry, entries)
+        if cluster is None:
+            return {"keep": self._localized_scope_labels["keep"]}
+        return {
+            "keep": self._localized_scope_labels["keep"],
+            "independent": self._localized_scope_labels["independent"],
+        }
+
+    def _cluster_association_choices(self):
+        entries = list(self.hass.config_entries.async_entries(DOMAIN))
+        choices = {"keep": getattr(self, "_localized_scope_labels", {}).get("keep", "keep")}
+        for candidate in entries:
+            result = cluster_association_preflight(
+                self.config_entry, candidate, entries
+            )
+            if not result.allowed:
+                continue
+            title = getattr(candidate, "title", candidate.entry_id)
+            host = candidate.data.get(CONF_HOST, "?")
+            cluster_name = candidate.data.get("cluster_name", "?")
+            choices[f"associate:{candidate.entry_id}"] = (
+                f"{title} — {host} ({cluster_name})"
+            )
+        return choices
+
+    def _cluster_association_validator(self):
+        return getattr(vol, "In", lambda choices: str)(
+            self._cluster_association_choices()
+        )
+
+    def _cluster_association_target(self):
+        target_id = getattr(self, "_pending_cluster_association_id", None)
+        return next(
+            (
+                candidate
+                for candidate in self.hass.config_entries.async_entries(DOMAIN)
+                if candidate.entry_id == target_id
+            ),
+            None,
+        )
+
+    async def async_step_cluster_association_confirm(self, user_input=None):
+        target = self._cluster_association_target()
+        entries = list(self.hass.config_entries.async_entries(DOMAIN))
+        result = (
+            cluster_association_preflight(self.config_entry, target, entries)
+            if target is not None
+            else None
+        )
+        if user_input is not None:
+            if not user_input.get("confirm", False):
+                return self.async_create_entry(title="", data={})
+            if result is None or not result.allowed:
+                return self.async_show_form(
+                    step_id="cluster_association_confirm",
+                    data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+                    errors={"base": result.reason if result else "association_target_not_available"},
+                )
+            data = dict(target.data)
+            data[CLUSTER_SCOPE_ID] = entry_cluster_scope_id(self.config_entry)
+            data[CLUSTER_SCOPE_STATE] = cluster_scope_status(self.config_entry)
+            self.hass.config_entries.async_update_entry(target, data=data)
+            return self.async_create_entry(title="", data={})
+        if result is None or not result.allowed:
+            return self.async_show_form(
+                step_id="cluster_association_confirm",
+                data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+                errors={"base": result.reason if result else "association_target_not_available"},
+            )
+        source_title = getattr(self.config_entry, "title", self.config_entry.entry_id)
+        target_title = getattr(target, "title", target.entry_id)
+        scope = entry_cluster_scope_id(self.config_entry)
+        return self.async_show_form(
+            step_id="cluster_association_confirm",
+            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+            description_placeholders={
+                "source": source_title,
+                "target": target_title,
+                "scope": f"{scope[:8]}…{scope[-4:]}",
+            },
+        )
+
+    async def async_step_scope_confirm(self, user_input=None):
+        """Persist an explicitly confirmed scope change and nothing else."""
+        if user_input is not None:
+            if not user_input.get("confirm", False):
+                return self.async_create_entry(title="", data={})
+            action = self._pending_scope_action
+            data = dict(self.config_entry.data)
+            if action == "independent":
+                data[CLUSTER_SCOPE_ID] = new_cluster_scope_id()
+            else:
+                target_id = action.removeprefix("join:")
+                target = self.hass.config_entries.async_get_entry(target_id)
+                scope_of = globals().get("entry_cluster_scope_id", lambda value: None)
+                scope = scope_of(target) if target else None
+                if scope is None:
+                    return self.async_create_entry(title="", data={})
+                data[CLUSTER_SCOPE_ID] = scope
+            # Existing entries require the later, opt-in assisted migration.
+            data[CLUSTER_SCOPE_STATE] = PENDING_SCOPE
+            self.hass.config_entries.async_update_entry(self.config_entry, data=data)
+            await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            return self.async_create_entry(title="", data={})
+        return self.async_show_form(
+            step_id="scope_confirm",
+            data_schema=vol.Schema({vol.Required("confirm", default=False): bool}),
+        )
 
     async def async_step_init(self, user_input=None) -> FlowResult:
 
@@ -178,6 +322,8 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_pve(self, user_input=None) -> FlowResult:
 
+        self._localized_scope_labels = await self._scope_labels()
+
         conf = self.config_entry.data
         options = self.config_entry.options or {}
         wol_mac_map = options.get("wol_macs", {})
@@ -197,6 +343,10 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
         self._cluster_nodes = cluster_nodes
 
         if user_input is not None:
+            action = user_input.get("cluster_scope_action", "keep")
+            if action == "independent" and action in self._scope_choices():
+                self._pending_scope_action = action
+                return await self.async_step_scope_confirm()
             plans = {}
             changed_fields = [field for field in ("vms", "cts") if field in user_input
                               and set(user_input[field]) != set(getattr(self, "_guest_defaults", {}).get(field, []))]
@@ -270,10 +420,11 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
                         target_options[key] = list(plan[target.entry_id])
                 if target.entry_id != self.config_entry.entry_id and target_options != dict(target.options):
                     self.hass.config_entries.async_update_entry(target, options=target_options)
-            self.hass.config_entries.async_update_entry(
-                self.config_entry, data=new_data, options=new_options,
-            )
-            await self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            if new_data != dict(self.config_entry.data) or new_options != dict(options):
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry, data=new_data, options=new_options,
+                )
+                await self.hass.config_entries.async_reload(self.config_entry.entry_id)
             return self.async_create_entry(title="", data=new_options)
 
         # Load resources via API
@@ -359,8 +510,7 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
                 ): str
             }
 
-            self._pve_schema = vol.Schema(
-                    {
+            schema_fields = {
                         vol.Optional("vms", default=selected_vms): cv.multi_select(
                             vm_options
                         ),
@@ -390,16 +540,19 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
                             CONF_VERIFY_SSL,
                             default=conf.get(CONF_VERIFY_SSL, False),
                         ): bool,
-                        **wol_fields,
-                    }
+                **wol_fields,
+            }
+            if len(self._scope_choices()) > 1:
+                schema_fields[vol.Optional("cluster_scope_action", default="keep")] = (
+                    self._scope_validator()
                 )
+            self._pve_schema = vol.Schema(schema_fields)
             return self.async_show_form(step_id="init", data_schema=self._pve_schema)
 
         except Exception:
             _LOGGER.exception("PVE options fallback: guest discovery is unavailable")
             self._guest_choices = None
-            self._pve_schema = vol.Schema(
-                    {
+            schema_fields = {
                         vol.Optional("wol_mac", default=wol_mac_map.get(current_node, "")): str,
                         vol.Optional(
                             "enable_physical_disks",
@@ -421,7 +574,11 @@ class ProxmoxOptionsFlow(config_entries.OptionsFlow):
                             CONF_VERIFY_SSL,
                             default=conf.get(CONF_VERIFY_SSL, False),
                         ): bool,
-                    }
+            }
+            if len(self._scope_choices()) > 1:
+                schema_fields[vol.Optional("cluster_scope_action", default="keep")] = (
+                    self._scope_validator()
                 )
+            self._pve_schema = vol.Schema(schema_fields)
             return self.async_show_form(step_id="init", data_schema=self._pve_schema,
                                         errors={"base": "guest_discovery_unavailable"})
