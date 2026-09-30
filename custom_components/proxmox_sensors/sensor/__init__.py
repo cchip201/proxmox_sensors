@@ -23,6 +23,7 @@ from ..logic.guest_keys import (
 from ..logic.guest_selection import get_cycle_guest_selections, allow_excluded_cluster_guest_cleanup
 from ..logic.cluster_scope import cluster_guest_identity_context, guest_identity_context, scoped_migration_target
 from ..logic.guest_identity import resolve_legacy_guest_identity
+from ..logic.guest_identity_diagnostics import warn_ambiguous_guest
 from ..logic.pve_local_identity import (
     coordinator_pve_local_identity_context,
     mounted_disks_identifier,
@@ -118,9 +119,17 @@ def _legacy_guest_identity_resolver(hass, entry):
     devices = dr.async_get(hass)
     rows = er.async_entries_for_config_entry(registry, entry.entry_id)
     device_rows = dr.async_entries_for_config_entry(devices, entry.entry_id)
-    return lambda kind, vmid, node: resolve_legacy_guest_identity(
-        kind, vmid, node, rows, device_rows
-    )
+    def resolve(kind, vmid, node):
+        identity = resolve_legacy_guest_identity(
+            kind, vmid, node, rows, device_rows
+        )
+        if identity.ambiguous:
+            warn_ambiguous_guest(
+                hass.data[DOMAIN][entry.entry_id], entry.entry_id, kind, vmid, node
+            )
+        return identity
+
+    return resolve
 
 
 def _build_guest_entities(
@@ -947,7 +956,10 @@ async def async_setup_entry(
                     cpu_created = True
 
                 # ---------------- CHIPSET (only one clean) ----------------
-                if any(x in sid for x in ["pch"]):
+                if (
+                    any(x in sid for x in ["pch"])
+                    and detect_sensor_type(hardware_data[key]) == "temperature"
+                ):
                     if chipset_created:
                         continue
 
