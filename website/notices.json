@@ -1,11 +1,11 @@
 {
   "notices": [
     {
-      "id": "release-5-1-1-coming-soon",
+      "id": "v5-2-0-pdm-module",
       "active": true,
-      "level": "warning",
-      "title": "Version 5.1.1 is coming soon",
-      "message": "A corrective 5.1.1 release is coming soon with targeted fixes and stability improvements."
+      "level": "info",
+      "title": "Proxmox Datacenter Manager is coming to V5.2.0",
+      "message": "V5.2.0 will introduce PDM as a new module alongside PVE, PBS and CLUSTER, providing centralized monitoring of Proxmox infrastructure through a single Datacenter Manager connection."
     }
   ]
 }
