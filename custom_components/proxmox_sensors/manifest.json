@@ -11,8 +11,7 @@
   "issue_tracker": "https://github.com/Javisen/proxmox_sensors/issues",
   "loggers": ["custom_components.proxmox_sensors"],
   "requirements": [
-    "aiohttp>=3.9.0",
     "proxmoxer>=2.0.0"
   ],
-  "version": "5.1.2-cmcore.1"
+  "version": "5.1.3-cmcore.1"
 }
