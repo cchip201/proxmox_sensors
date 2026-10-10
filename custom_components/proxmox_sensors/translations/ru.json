@@ -51,6 +51,11 @@
           "verify_ssl": "Проверять SSL-сертификат"
         }
       },
+      "credentials_pdm": {
+        "title": "3. Access Credentials — Proxmox Datacenter Manager",
+        "description": "Enter the API token details for PDM (port 8443).",
+        "data": {"user": "User (including realm)", "token_id": "Token ID", "token_secret": "Token Secret", "verify_ssl": "Verify SSL Certificate"}
+      },
       "cluster_association": {
         "title": "Привязка CLUSTER",
         "description": "Создайте новую привязку или восстановите привязку PVE без связанного CLUSTER. Имя и адрес не определяют членство.",
@@ -107,6 +112,8 @@
     "error": {
       "recovery_unavailable": "Группа PVE изменилась или её идентичность конфликтует с Registry. Выберите снова; CLUSTER не создан.",
       "cluster_unavailable": "Выбранный кластер больше недоступен для присоединения. Вернитесь назад или выберите другой кластер.",
+      "invalid_host": "Enter a valid hostname or IP address without a protocol, path, or port.",
+      "ipv6_not_supported": "IPv6 addresses are currently supported only for PVE and CLUSTER connections.",
       "cannot_connect": "Ошибка подключения. Проверьте адрес сервера.",
       "invalid_auth": "Ошибка аутентификации. Проверьте учетные данные или права токена.",
       "insufficient_permissions": "У учетной записи недостаточно прав для доступа к необходимым ресурсам Proxmox.",
@@ -152,6 +159,7 @@
           "enable_physical_disks": "Включить мониторинг физических дисков",
           "enable_smart_monitoring": "Включить мониторинг здоровья SMART и NVMe",
           "enable_node_controls": "Включить управление питанием узла",
+          "enable_guest_agent_metrics": "Включить метрики Guest Agent",
           "enable_backup_progress": "Включить датчик прогресса резервного копирования",
           "enable_storage_list": "Включить датчик списка хранилищ",
           "enable_nodes_list": "Включить датчик списка узлов",
@@ -226,6 +234,9 @@
       },
       "vm_status": {
         "name": "Статус"
+      },
+      "vm_disk_usage": {
+        "name": "Использование диска ВМ"
       },
       "vm_cpu_usage": {
         "name": "Использование ЦП"
@@ -414,6 +425,27 @@
       },
       "cluster_ha_status": {
         "name": "Статус HA"
+      },
+      "cluster_qdevice": {
+        "name": "QDevice Corosync"
+      },
+      "pdm_status": {
+        "name": "Datacenter Status"
+      },
+      "pdm_inventory": {
+        "name": "Datacenter Inventory"
+      },
+      "pdm_capacity": {
+        "name": "Datacenter Capacity"
+      },
+      "pdm_updates": {
+        "name": "Datacenter Updates"
+      },
+      "pdm_remote_status": {
+        "name": "Remote Status"
+      },
+      "pdm_remote_overview": {
+        "name": "Remote Overview"
       },
       "cluster_firewall": {
         "name": "Файрвол"
@@ -698,7 +730,7 @@
       }
     }
   },
-  "selector": {"platform_type": {"options": {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "cluster": "Кластер Proxmox"}}, "cluster_scope_action": {"options": {"keep": "Сохранить связь с кластером", "independent": "Независимо — без миграции сущностей VM/LXC между узлами"}}},
+  "selector": {"platform_type": {"options": {"pve": "Proxmox VE", "pbs": "Proxmox Backup Server", "cluster": "Кластер Proxmox", "pdm": "Proxmox Datacenter Manager"}}, "cluster_scope_action": {"options": {"keep": "Сохранить связь с кластером", "independent": "Независимо — без миграции сущностей VM/LXC между узлами"}}},
   "services": {
     "create_vzdump_backup": {
       "name": "Proxmox: Запустить резервное копирование",

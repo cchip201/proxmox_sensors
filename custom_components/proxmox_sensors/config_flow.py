@@ -1,8 +1,10 @@
 """CONFIG FLOW for Proxmox Extended Sensors."""
 
 from __future__ import annotations
+import ipaddress
 import logging
 import asyncio
+import re
 from .logic.cluster_scope import (
     ACTIVE_SCOPE, CLUSTER_SCOPE_ID, CLUSTER_SCOPE_STATE, new_cluster_scope_id,
     cluster_entry_scope_status, entry_cluster_scope_id, recoverable_pve_scopes,
@@ -33,6 +35,7 @@ from .const import (
     CONF_NODE,
     CONF_PLATFORM_TYPE,
     CONF_VERIFY_SSL,
+    PDM_IDENTITY_ID,
 )
 from .pbs_identity import (
     async_remember_pbs_identity,
@@ -45,6 +48,7 @@ from .logic.pve_local_identity import (
     new_pve_identity_id,
 )
 from .const import PVE_IDENTITY_ID, PVE_LOCAL_IDENTITY_VERSION
+from .logic.pdm import PDM_IDENTITY_VERSION, new_pdm_identity_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,12 +56,22 @@ SERVER_TYPES = {
     "PVE": "PVE",
     "PBS": "PBS",
     "CLUSTER": "CLUSTER",
+    "PDM": "PDM",
 }
 
 PVE_MIN_ENDPOINTS = ["nodes"]
 PVE_EXTRA_ENDPOINTS = ["cluster/resources"]
 PBS_MIN_ENDPOINTS = ["admin/datastore"]
 PBS_EXTRA_ENDPOINTS = ["version", "nodes/localhost/tasks"]
+PDM_MIN_ENDPOINTS = ["resources/status", "remotes/remote"]
+PDM_EXTRA_ENDPOINTS = [
+    "version",
+    "resources/list",
+    "resources/subscription",
+    "remotes/updates/summary",
+]
+
+_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 
 def _pbs_server_id_index(server_id: str | None) -> int | None:
@@ -92,6 +106,52 @@ def _normalized_config_host(value) -> str:
     return str(value or "").strip().rstrip(".").lower()
 
 
+def _config_host_error(value, platform) -> str | None:
+    """Validate a new config-entry host against the clients' real support."""
+    host = str(value or "").strip()
+    platform = str(platform or "").upper()
+    if not host or any(char.isspace() for char in host):
+        return "invalid_host"
+    if "://" in host or any(char in host for char in "/?#@"):
+        return "invalid_host"
+
+    address = host
+    if host.startswith("["):
+        if not host.endswith("]"):
+            return "invalid_host"
+        address = host[1:-1]
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            return "invalid_host"
+        if parsed.version != 6:
+            return "invalid_host"
+    else:
+        try:
+            parsed = ipaddress.ip_address(address)
+        except ValueError:
+            parsed = None
+
+    if parsed is not None:
+        if parsed.version == 6 and platform not in ("PVE", "CLUSTER"):
+            return "ipv6_not_supported"
+        return None
+
+    if ":" in host or set(host) <= set("0123456789."):
+        return "invalid_host"
+
+    hostname = host.rstrip(".")
+    if not hostname or len(hostname) > 253:
+        return "invalid_host"
+    try:
+        labels = [label.encode("idna").decode("ascii") for label in hostname.split(".")]
+    except UnicodeError:
+        return "invalid_host"
+    if not all(_HOST_LABEL.fullmatch(label) for label in labels):
+        return "invalid_host"
+    return None
+
+
 def _config_entry_platform(data) -> str:
     return str(data.get(CONF_PLATFORM_TYPE) or data.get("server_type") or "").upper()
 
@@ -109,6 +169,9 @@ def _config_entry_unique_id(data) -> str | None:
         return f"pbs:instance:{instance_id}" if instance_id else f"pbs:endpoint:{host}"
     if platform == "CLUSTER":
         return f"cluster:endpoint:{host}"
+    if platform == "PDM":
+        identity_id = str(data.get(PDM_IDENTITY_ID) or "").strip()
+        return f"pdm:instance:{identity_id}" if identity_id else None
     return None
 
 
@@ -134,6 +197,8 @@ def _equivalent_config_entry(data, entries) -> bool:
             elif host and host == existing_host:
                 return True
         elif platform == "CLUSTER" and host and host == existing_host:
+            return True
+        elif platform == "PDM" and host and host == existing_host:
             return True
     return False
 
@@ -162,9 +227,16 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_user(self, user_input=None) -> FlowResult:
 
+        errors = {}
         if user_input is not None:
-            self._config.update(user_input)
-            return await self.async_step_auth_method()
+            error = _config_host_error(
+                user_input.get(CONF_HOST), user_input.get(CONF_PLATFORM_TYPE)
+            )
+            if error is None:
+                user_input = {**user_input, CONF_HOST: user_input[CONF_HOST].strip()}
+                self._config.update(user_input)
+                return await self.async_step_auth_method()
+            errors[CONF_HOST] = error
 
         return self.async_show_form(
             step_id="user",
@@ -176,6 +248,7 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                 }
             ),
+            errors=errors,
         )
 
     async def _server_type_labels(self):
@@ -201,9 +274,13 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         server_type = self._config.get(CONF_PLATFORM_TYPE)
 
         # 🔥 SALTO DIRECTO PARA PBS
-        if server_type == "PBS":
+        if server_type in ("PBS", "PDM"):
             self._use_token = True
-            return await self.async_step_credentials_pbs()
+            return (
+                await self.async_step_credentials_pbs()
+                if server_type == "PBS"
+                else await self.async_step_credentials_pdm()
+            )
 
         if user_input is not None:
             self._use_token = user_input.get("use_token", False)
@@ -342,6 +419,46 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="credentials_pbs",
+            data_schema=vol.Schema(schema_dict),
+            errors=errors,
+        )
+
+    async def async_step_credentials_pdm(self, user_input=None) -> FlowResult:
+        errors = {}
+        schema_dict = {
+            vol.Required(CONF_USER): str,
+            vol.Required(CONF_TOKEN_ID): str,
+            vol.Required(CONF_TOKEN_SECRET): str,
+            vol.Optional(CONF_VERIFY_SSL, default=False): bool,
+        }
+        if user_input is not None:
+            self._config.update(user_input)
+            client = self._build_client("PDM")
+            try:
+                validation = await self._validate_connection(
+                    client, PDM_MIN_ENDPOINTS, PDM_EXTRA_ENDPOINTS
+                )
+            except AuthenticationError:
+                errors["base"] = "invalid_auth"
+            except ProxmoxPermissionError:
+                errors["base"] = "insufficient_permissions"
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected PDM credential validation error")
+                errors["base"] = "unknown"
+            else:
+                if not validation["has_minimum"]:
+                    errors["base"] = "insufficient_permissions"
+                else:
+                    self._config["limited_permissions"] = not validation["has_all"]
+                    self._config["pdm_identity_version"] = PDM_IDENTITY_VERSION
+                    self._config[PDM_IDENTITY_ID] = new_pdm_identity_id(
+                        self.hass.config_entries.async_entries(DOMAIN)
+                    )
+                    return await self._finish()
+        return self.async_show_form(
+            step_id="credentials_pdm",
             data_schema=vol.Schema(schema_dict),
             errors=errors,
         )
@@ -654,7 +771,8 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return {}
         try:
             rows = tuple(er.async_get(self.hass).entities.values())
-            devices = tuple(dr.async_get(self.hass).devices.values())
+            device_registry = dr.async_get(self.hass)
+            devices = tuple(device_registry.devices)
         except Exception:
             _LOGGER.exception("Unable to inspect registries for CLUSTER recovery")
             return {}
@@ -868,6 +986,10 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not title_name:
                 title_name = self._config.get(CONF_HOST)
 
+        # ============ PDM =================
+        elif server_type == "PDM":
+            self._config[CONF_NODE] = "PDM"
+            title_name = self._config.get(CONF_HOST)
 
         # ========== PVE =================
         else:
