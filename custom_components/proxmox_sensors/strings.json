@@ -9,6 +9,13 @@
           "platform_type": "Server Type"
         }
       },
+      "reconfigure": {
+        "title": "Change Server Address",
+        "description": "Change the address Home Assistant reaches node {node} through. The credentials, the node, the selected guests and storages and every entity stay as they are; the new address must answer with node {node}. A port may follow the name (proxy.example.net:443); without one PVE uses 8006.",
+        "data": {
+          "host": "Server Address (IP or FQDN, optionally :port)"
+        }
+      },
       "auth_method": {
         "title": "2. Authentication Method",
         "description": "Select authentication method. API Tokens are required for PBS and recommended for PVE.",
@@ -122,10 +129,14 @@
       "cannot_connect": "Connection error. Check the server address.",
       "invalid_auth": "Authentication failed. Check credentials or token permissions.",
       "insufficient_permissions": "The account does not have sufficient permissions to access the required Proxmox resources.",
-      "unknown": "Unexpected error. Check Home Assistant logs."
+      "unknown": "Unexpected error. Check Home Assistant logs.",
+      "invalid_host_port": "Enter a valid hostname or IP address, optionally followed by :port, without a protocol or path.",
+      "node_not_found": "The new address does not answer with this entry's node. Check that it leads to the same Proxmox node."
     },
     "abort": {
       "scope_unavailable": "Could not generate an unused CLUSTER association. Try again.",
+      "reconfigure_successful": "The server address was changed and the entry reloaded.",
+      "reconfigure_not_supported": "Only a PVE node entry can change its server address here.",
       "already_configured": "This node is already configured.",
       "no_data": "No cluster data received. Check your configuration.",
       "cluster_no_options": "Cluster settings are managed from the PVE node configuration.",

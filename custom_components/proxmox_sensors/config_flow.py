@@ -49,6 +49,7 @@ from .logic.pve_local_identity import (
 )
 from .const import PVE_IDENTITY_ID, PVE_LOCAL_IDENTITY_VERSION
 from .logic.pdm import PDM_IDENTITY_VERSION, new_pdm_identity_id
+from .logic.host_change import node_is_visible, split_host_port
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -150,6 +151,17 @@ def _config_host_error(value, platform) -> str | None:
     if not all(_HOST_LABEL.fullmatch(label) for label in labels):
         return "invalid_host"
     return None
+
+
+def _reconfigure_host_error(value, platform) -> str | None:
+    """A new address for an EXISTING entry: the rules of a new entry's host, plus an
+    optional ``:port`` after it - the form every PVE entry made before the 5.2.0 host
+    validation already carries (``proxmox.cmcore.net:443`` behind a reverse proxy)."""
+    parts = split_host_port(value)
+    if parts is None:
+        return "invalid_host_port"
+    host, _port = parts
+    return "invalid_host_port" if _config_host_error(host, platform) else None
 
 
 def _config_entry_platform(data) -> str:
@@ -1040,6 +1052,89 @@ class ProxmoxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._config[CLUSTER_SCOPE_STATE] = ACTIVE_SCOPE
         title = f"{server_type}: {title_name}"
         return self.async_create_entry(title=title, data=self._config)
+
+    # ===== RECONFIGURE — SERVER ADDRESS (PVE, cmcore fork) ====
+
+    async def async_step_reconfigure(self, user_input=None) -> FlowResult:
+        """Change the address a PVE entry reaches its node through.
+
+        Only the host changes: the credentials, the node, the guest and storage
+        selections and every entity stay as they are. The new address is checked with
+        the entry's own credentials and must answer with the entry's node, so an
+        address that reaches another node is refused. Other platforms abort.
+        """
+        entry = self._get_reconfigure_entry()
+        data = dict(entry.data)
+        platform = _config_entry_platform(data)
+        if platform != "PVE":
+            return self.async_abort(reason="reconfigure_not_supported")
+
+        errors = {}
+        if user_input is not None:
+            host = str(user_input.get(CONF_HOST) or "").strip()
+            error = _reconfigure_host_error(host, platform)
+            if error is not None:
+                errors[CONF_HOST] = error
+            else:
+                new_data = {**data, CONF_HOST: host}
+                others = [
+                    other
+                    for other in self.hass.config_entries.async_entries(DOMAIN)
+                    if other.entry_id != entry.entry_id
+                ]
+                if _equivalent_config_entry(new_data, others):
+                    return self.async_abort(reason="already_configured")
+                new_unique_id = None
+                if entry.unique_id is not None:
+                    new_unique_id = _config_entry_unique_id(new_data)
+                    taken = self.hass.config_entries.async_entry_for_domain_unique_id(
+                        DOMAIN, new_unique_id
+                    ) if new_unique_id else None
+                    if taken is not None and taken.entry_id != entry.entry_id:
+                        return self.async_abort(reason="already_configured")
+                self._config = new_data
+                client = self._build_client("PVE")
+                try:
+                    validation = await self._validate_connection(
+                        client, PVE_MIN_ENDPOINTS, PVE_EXTRA_ENDPOINTS
+                    )
+                    nodes = (
+                        await client.get(self.hass, "nodes", raise_errors=True)
+                        if validation["has_minimum"]
+                        else None
+                    )
+                except AuthenticationError as err:
+                    _LOGGER.debug("PVE reconfigure: %s: %s", type(err).__name__, err)
+                    errors["base"] = "invalid_auth"
+                except ProxmoxPermissionError as err:
+                    _LOGGER.debug("PVE reconfigure: %s: %s", type(err).__name__, err)
+                    errors["base"] = "insufficient_permissions"
+                except CannotConnect as err:
+                    _LOGGER.debug("PVE reconfigure: %s: %s", type(err).__name__, err)
+                    errors["base"] = "cannot_connect"
+                except Exception as err:
+                    _LOGGER.exception("Unexpected PVE reconfigure error: %s", err)
+                    errors["base"] = "unknown"
+                else:
+                    if not validation["has_minimum"]:
+                        errors["base"] = "insufficient_permissions"
+                    elif not node_is_visible(nodes, data.get(CONF_NODE)):
+                        errors["base"] = "node_not_found"
+                    else:
+                        updates = {"data_updates": {CONF_HOST: host}}
+                        if new_unique_id is not None:
+                            updates["unique_id"] = new_unique_id
+                        return self.async_update_reload_and_abort(entry, **updates)
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                vol.Schema({vol.Required(CONF_HOST): str}),
+                {CONF_HOST: data.get(CONF_HOST, "")},
+            ),
+            errors=errors,
+            description_placeholders={"node": str(data.get(CONF_NODE) or "")},
+        )
 
     # ===== OPTIONS FLOW ======================================
 
