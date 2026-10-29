@@ -7,6 +7,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity_platform import async_get_platforms
 
 from ..const import DOMAIN, CONF_NODE, CONF_PLATFORM_TYPE
+from .guest_selection import get_entry_guest_selection, guest_unselected
 from .pve_local_identity import PveLocalIdentityError, node_device_identifier
 
 
@@ -196,9 +197,16 @@ def can_remove_pve_device(hass, entry, device):
         local = data.get("vms" if kind == "vm" else "cts")
         if not isinstance(local, dict):
             return False
-        for resource in resources + list(local.values()):
-            if not isinstance(resource, dict):
-                return False
-            if str(resource.get("vmid")) == vmid:
-                return False
+        built = list(local.values())
+        if any(not isinstance(resource, dict) for resource in resources + built):
+            return False
+        # A guest the entry no longer selects may keep its VMID on the node (the 720
+        # keeps stopped replicas of guests that moved): only a guest this entry still
+        # builds keeps its device then. A selected guest keeps the full check.
+        selection = get_entry_guest_selection(
+            entry, "selected_vms" if kind == "vm" else "selected_cts"
+        )
+        present = built if guest_unselected(selection, vmid) else resources + built
+        if any(str(resource.get("vmid")) == vmid for resource in present):
+            return False
     return True

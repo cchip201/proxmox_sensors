@@ -152,6 +152,20 @@ def selection_guest_ids(selection):
     return result
 
 
+def guest_unselected(selection, vmid) -> bool:
+    """True only when ``selection`` is a readable guest list that does not hold ``vmid``.
+
+    Stored ids may be str or int, bare or ``node:VMID``. A missing selection, the legacy
+    "every guest" marker ``None``, or one that cannot be read is never unselected
+    (cmcore fork, 2026-10-28).
+    """
+    try:
+        ids = selection_guest_ids(selection)
+        return ids is not None and int(vmid) not in {int(value) for value in ids}
+    except (TypeError, ValueError):
+        return False
+
+
 def plan_guest_selection(entries, key, chosen, visible, inventory_valid, previous_ids=()):
     """Plan all sibling writes before mutating any entry. Never drop absent IDs."""
     if not inventory_valid:
