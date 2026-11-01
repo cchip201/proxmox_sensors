@@ -21,6 +21,25 @@ def detect_sensor_type(value):
     return "temperature"
 
 
+_HBA_ROC_KEY = re.compile(r"^storcli-hba-([0-9a-f]{16})_roc temperature$")
+
+
+def hba_roc_name(sensor_key, hardware):
+    match = _HBA_ROC_KEY.fullmatch(sensor_key)
+    if not match:
+        return None
+    identity = match.group(1)
+    others = {
+        candidate.group(1)
+        for key in hardware
+        if (candidate := _HBA_ROC_KEY.fullmatch(key)) and key != sensor_key
+    }
+    for length in range(8, 17):
+        if all(identity[:length] != other[:length] for other in others):
+            return f"HBA {identity[:length]} ROC Temperature"
+    return f"HBA {identity} ROC Temperature"
+
+
 class ProxmoxHardwareSensor(ProxmoxBaseSensor):
     def __init__(self, coordinator, sensor_key, node):
 
@@ -71,7 +90,8 @@ class ProxmoxHardwareSensor(ProxmoxBaseSensor):
         elif not self._is_chipset:
             self._attr_translation_key = "hardware_temperature"
             self._attr_translation_placeholders = {
-                "name": sensor_key.replace("_", " ").replace("-", " ").title()
+                "name": hba_roc_name(sensor_key, coordinator.data.get("hardware", {}))
+                or sensor_key.replace("_", " ").replace("-", " ").title()
             }
 
         if self._sensor_type == "voltage":
@@ -95,6 +115,7 @@ class ProxmoxHardwareSensor(ProxmoxBaseSensor):
             cores = []
             cpu_critical = None
             cpu_fallback = None
+            chip_fallback = None
 
             for key, val in hw.items():
                 kl = key.lower()
@@ -144,6 +165,10 @@ class ProxmoxHardwareSensor(ProxmoxBaseSensor):
                 # Keep this as a final fallback and accept only temp*_input.
                 if cpu_fallback is None and "cpu" in kl:
                     cpu_fallback = self._parse_cpu_temperature_fallback(val)
+                if chip_fallback is None and kl.startswith(
+                    ("k10temp-", "coretemp-", "zenpower-")
+                ):
+                    chip_fallback = self._parse_cpu_temperature_fallback(val)
 
             # -------- priority --------
             if package_temp is not None:
@@ -152,7 +177,7 @@ class ProxmoxHardwareSensor(ProxmoxBaseSensor):
             if cores:
                 return round(sum(cores) / len(cores), 1)
 
-            return cpu_fallback
+            return cpu_fallback if cpu_fallback is not None else chip_fallback
 
         # -------- Non-CPU --------
         return self._parse(hw.get(self._key, hw.get(self._sensor_key)))
@@ -265,7 +290,7 @@ class ProxmoxHardwareSensor(ProxmoxBaseSensor):
         return "temperature"
 
     def _parse_cpu_temperature_fallback(self, val):
-        """Extract one valid temp*_input reading from an ARM CPU block."""
+        """Extract one valid temp*_input reading from a CPU block."""
         if not isinstance(val, dict):
             return None
 

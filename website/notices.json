@@ -1,18 +1,27 @@
+
 {
   "notices": [
     {
-      "id": "new-v5.2.0-release",
+      "id": "upcoming-v5.2.1",
       "active": true,
       "level": "info",
-      "title": "New V5.2.0 ready for release.",
-      "message": "New Proxmox Datacenter Manager monitoring - PDM Dashboard View - QDevice - VM Disk Usage / Guest Agent Metrics"
+      "title": "Proxmox Extended Sensors V5.2.1 Coming Soon!",
+      "message": "V5.2.1 is on the way! This maintenance update focuses on bug fixes, improved VM/LXC migration handling, device cleanup, and overall stability and reliability.",
+      "es": {
+        "title": "¡Proxmox Extended Sensors V5.2.1 próximamente!",
+        "message": "¡La versión 5.2.1 está en camino! Esta actualización de mantenimiento se centra en la corrección de errores, mejoras en las migraciones de VM/LXC, limpieza de dispositivos y mayor estabilidad y fiabilidad general."
+      }
     },
     {
-      "id": "v5-2-0-pdm-module",
+      "id": "upcoming-light-dashboard",
       "active": true,
       "level": "info",
-      "title": "Proxmox Datacenter Manager monitoring in V5.2.0",
-      "message": "V5.2.0 introduces PDM as a new module alongside PVE, PBS and CLUSTER, providing centralized monitoring of Proxmox infrastructure through a single Datacenter Manager connection."
+      "title": "New Dashboard with Light and Dark Theme Support!",
+      "message": "A refreshed dashboard is coming with V5.2.1! Enjoy a new light appearance featuring clean white cards, Proxmox orange accents, and automatic adaptation to your Home Assistant theme, while preserving the original dark design.",
+      "es": {
+        "title": "¡Nuevo dashboard compatible con temas claros y oscuros!",
+        "message": "¡La versión 5.2.1 estrenará un dashboard renovado! Disfruta de un nuevo diseño claro con tarjetas blancas, detalles en naranja Proxmox y adaptación automática al tema de Home Assistant, conservando intacto el diseño oscuro original."
+      }
     }
   ]
 }
