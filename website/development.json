@@ -1,53 +1,54 @@
+
 {
-  "version": "5.2.1",
+  "version": "5.2.2",
   "release_status": "development",
   "items": [
     {
-      "id": "guest-migration-fixes",
-      "active": true,
-      "status": "completed",
-      "progress": null,
-      "title": "VM/LXC Migration Reliability",
-      "message": "Fixed guest migration between PVE cluster nodes, ensuring sensors and control buttons follow the guest correctly. Also fixed cleanup of empty source devices after migration. Validated in a real Home Assistant environment.",
-      "es": {
-        "title": "Fiabilidad de la migración de VM/LXC",
-        "message": "Corregida la migración de máquinas virtuales y contenedores entre nodos del clúster PVE para que los sensores y botones de control sigan al sistema migrado. También se corrigió la limpieza de los dispositivos vacíos del nodo de origen tras la migración. Validado en un entorno real de Home Assistant."
-      }
-    },
-    {
-      "id": "amd-cpu-temperature-fix",
-      "active": true,
-      "status": "completed",
-      "progress": null,
-      "title": "CPU Temperature Detection",
-      "message": "Fixed CPU temperature detection for k10temp, coretemp and zenpower when standard temperature labels are unavailable. Regression tests passed. Awaiting hardware validation from the reporter of issue #88.",
-      "es": {
-        "title": "Detección de la temperatura de la CPU",
-        "message": "Corregida la detección de la temperatura de la CPU para k10temp, coretemp y zenpower cuando no están disponibles las etiquetas de temperatura habituales. Las pruebas de regresión se han superado. Pendiente de validación en el hardware por parte de quien informó de la incidencia #88."
-      }
-    },
-    {
-      "id": "vm-filesystem-selection",
+      "id": "smart-dashboard-improvements",
       "active": true,
       "status": "testing",
       "progress": null,
-      "title": "Extended VM Filesystem Detection",
-      "message": "Investigating improved VM filesystem selection through QEMU Guest Agent for Windows guests and systems such as Home Assistant OS where the main writable filesystem is not mounted at /. Requested in issue #86.",
+      "title": "Enhanced Physical Disks and SMART Dashboard",
+      "message": "Major improvements to physical disk monitoring in Home Assistant. Each disk now has its own device with detailed SMART metrics, health status, temperature, wear indicators and disk-specific controls. The dashboard includes clearer disk identification, improved temperature displays and enhanced storage diagnostics.",
       "es": {
-        "title": "Detección ampliada de sistemas de archivos de VM",
-        "message": "Se estudia una mejor selección del sistema de archivos de las máquinas virtuales mediante QEMU Guest Agent para sistemas Windows y otros como Home Assistant OS, cuyo sistema de archivos principal con permisos de escritura no está montado en /. Solicitado en la incidencia #86."
+        "title": "Mejoras de discos físicos y dashboard SMART",
+        "message": "Importante renovación de la monitorización de discos físicos en Home Assistant. Cada disco dispone ahora de su propio dispositivo, con métricas SMART detalladas, estado de salud, temperatura, indicadores de desgaste y controles individuales. El dashboard incorpora una identificación más clara de los discos, mejoras en las temperaturas y diagnósticos de almacenamiento."
       }
     },
     {
-      "id": "lsi-broadcom-controller-temperature",
+      "id": "individual-smart-control",
+      "active": true,
+      "status": "testing",
+      "progress": null,
+      "title": "Individual SMART Monitoring and Disk Controls",
+      "message": "Introducing independent SMART monitoring controls for each physical disk, including enable/disable switches, configurable polling intervals, HDD standby protection and automatic or manual HDD/SSD/NVMe classification. Disk settings are preserved independently, allowing users to optimize monitoring without unnecessary disk activity.",
+      "es": {
+        "title": "Control SMART individual por disco",
+        "message": "Se incorporan controles independientes de monitorización SMART para cada disco físico, incluyendo activación y desactivación, intervalos de consulta configurables, protección del reposo de los HDD y clasificación automática o manual como HDD, SSD o NVMe. La configuración se conserva individualmente, permitiendo optimizar la monitorización y evitar actividad innecesaria en los discos."
+      }
+    },
+    {
+      "id": "sidecar-smart-optimization",
       "active": true,
       "status": "completed",
       "progress": null,
-      "title": "LSI/Broadcom SAS Controller Temperature",
-      "message": "Evaluating optional temperature monitoring for LSI/Broadcom SAS HBA and RAID controllers using storcli, including compatibility, permissions and safe execution. Requested in issue #87.",
+      "title": "Sidecar SMART Performance Optimization",
+      "message": "Improved SMART data collection in the Proxmox sidecar with individual disk queries, more efficient polling and HDD standby protection. Enhanced SMART attribute parsing and NVMe compatibility while preserving existing monitoring functionality.",
       "es": {
-        "title": "Temperatura de controladoras SAS LSI/Broadcom",
-        "message": "Se evalúa la monitorización opcional de la temperatura de controladoras HBA y RAID SAS LSI/Broadcom mediante storcli, incluida la compatibilidad, los permisos y la ejecución segura. Solicitado en la incidencia #87."
+        "title": "Optimización SMART del sidecar",
+        "message": "Mejorada la recopilación SMART del sidecar de Proxmox mediante consultas individuales por disco, una monitorización más eficiente y protección del reposo de los HDD. Se ha perfeccionado la interpretación de atributos SMART y la compatibilidad con NVMe, manteniendo las funcionalidades de monitorización existentes."
+      }
+    },
+    {
+      "id": "smart-refresh-interval",
+      "active": true,
+      "status": "completed",
+      "progress": null,
+      "title": "Configurable SMART Refresh Intervals",
+      "message": "SMART polling intervals can now be configured independently of the general Proxmox refresh cycle, with per-disk settings and the option to inherit the global interval. This reduces unnecessary disk queries without affecting other monitoring data.",
+      "es": {
+        "title": "Intervalos de actualización SMART configurables",
+        "message": "Los intervalos de consulta SMART pueden configurarse independientemente del ciclo general de actualización de Proxmox, con ajustes individuales por disco y opción de heredar el intervalo global. Esto reduce las consultas innecesarias sin afectar al resto de los datos de monitorización."
       }
     }
   ]
