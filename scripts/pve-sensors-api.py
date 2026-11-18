@@ -235,19 +235,56 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_response("Invalid block device path")
             return
         try:
-            if not stat.S_ISBLK(os.stat(path).st_mode):
+            device_stat = os.stat(path)
+            if not stat.S_ISBLK(device_stat.st_mode):
                 self._send_error_response("Path is not a block device")
                 return
+            use_sat = False
+            try:
+                sysfs_device = Path(
+                    f"/sys/dev/block/{os.major(device_stat.st_rdev)}:{os.minor(device_stat.st_rdev)}"
+                ).resolve(strict=True)
+                for parent in (sysfs_device, *sysfs_device.parents):
+                    vendor = parent / "idVendor"
+                    product = parent / "idProduct"
+                    if vendor.is_file() and product.is_file():
+                        use_sat = (vendor.read_text(encoding="ascii").strip().lower() == "0bda"
+                                   and product.read_text(encoding="ascii").strip().lower() == "9201")
+                        break
+            except (OSError, RuntimeError):
+                pass
             command = ["smartctl"]
             if protect == ["1"]:
                 command.extend(("-n", "standby,3,5"))
+            if use_sat:
+                command.extend(("-d", "sat"))
             command.extend(("-a", "-j", path))
             result = subprocess.run(command, capture_output=True, text=True, timeout=7)
             if protect == ["1"] and result.returncode in (3, 5):
                 status = "standby" if result.returncode == 3 else "unsupported"
                 self._send_json_response(json.dumps({"status": status}))
                 return
-            raw = json.loads(result.stdout)
+            try:
+                raw = json.loads(result.stdout)
+            except ValueError:
+                raw = None
+            smartctl_info = raw.get("smartctl") if isinstance(raw, dict) else None
+            messages = smartctl_info.get("messages") if isinstance(smartctl_info, dict) else None
+            unknown_usb_bridge = "Unknown USB bridge" in (result.stderr or "") or any(
+                isinstance(message, dict) and isinstance(message.get("string"), str)
+                and "Unknown USB bridge" in message["string"]
+                for message in (messages if isinstance(messages, list) else [])
+            )
+            if not use_sat and result.returncode and unknown_usb_bridge and not (
+                isinstance(raw, dict) and isinstance(raw.get("smart_status"), dict)
+            ):
+                sat_command = command[:-3] + ["-d", "sat"] + command[-3:]
+                result = subprocess.run(sat_command, capture_output=True, text=True, timeout=7)
+                if protect == ["1"] and result.returncode in (3, 5):
+                    status = "standby" if result.returncode == 3 else "unsupported"
+                    self._send_json_response(json.dumps({"status": status}))
+                    return
+                raw = json.loads(result.stdout)
             if (not isinstance(raw, dict)
                     or not isinstance(raw.get("smart_status"), dict)
                     or type(raw["smart_status"].get("passed")) is not bool):
@@ -769,7 +806,60 @@ class Handler(BaseHTTPRequestHandler):
                         if type(value) is int and 0 <= value <= 255:
                             parsed[field] = value
 
+        if device_type == "scsi":
+            parsed["wwn"] = self._smart_wwn(disk_info)
+            self._apply_scsi_counters(disk_info, parsed)
         return parsed
+
+    @staticmethod
+    def _smart_wwn(disk_info):
+        """World Wide Name as 16 lowercase hex digits, or None.
+
+        Proxmox lists SAS drives (and some others) by WWN rather than by the
+        vendor serial, so the WWN lets the integration match the two.
+        """
+        raw_luid = disk_info.get("logical_unit_id")
+        luid = None
+        if raw_luid is not None:
+            if not isinstance(raw_luid, str):
+                return None
+            luid = raw_luid.strip().lower().removeprefix("0x")
+            if not re.fullmatch(r"[0-9a-f]{16}", luid) or not int(luid, 16):
+                return None
+        wwn = disk_info.get("wwn")
+        alternate = None
+        if wwn is not None:
+            if not isinstance(wwn, dict) or not all(
+                type(wwn.get(k)) is int and 0 <= wwn[k] < limit
+                for k, limit in (("naa", 16), ("oui", 16**6), ("id", 16**9))
+            ):
+                return None
+            alternate = f"{wwn['naa']:x}{wwn['oui']:06x}{wwn['id']:09x}"
+            if not int(alternate, 16):
+                return None
+        if luid and alternate and luid != alternate:
+            return None
+        return luid or alternate
+
+    @staticmethod
+    def _apply_scsi_counters(disk_info, parsed):
+        """SCSI/SAS equivalents of the ATA counters, when smartctl has them."""
+        if (disk_info.get("device") or {}).get("type") != "scsi":
+            return
+        grown = disk_info.get("scsi_grown_defect_list")
+        if type(grown) is int and grown >= 0 and parsed.get("reallocated_sectors") is None:
+            parsed["reallocated_sectors"] = grown
+        log = disk_info.get("scsi_error_counter_log")
+        if isinstance(log, dict) and parsed.get("uncorrectable_errors") is None:
+            total = 0
+            seen = False
+            for direction in ("read", "write", "verify"):
+                value = (log.get(direction) or {}).get("total_uncorrected_errors")
+                if type(value) is int and value >= 0:
+                    total += value
+                    seen = True
+            if seen:
+                parsed["uncorrectable_errors"] = total
 
     def _parse_basic_info_text(self, text_output, returncode):
         parsed = {
