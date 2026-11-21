@@ -1,7 +1,7 @@
 """Changing the address of an EXISTING PVE entry (cmcore fork, 2026-10-22).
 
 Every PVE entry made before the 5.2.0 host validation keeps its node behind a reverse
-proxy as ``name:port`` (``proxmox.cmcore.net:443``), and both clients honor that port:
+proxy as ``name:port`` (``pve.example.lan:443``), and both clients honor that port:
 proxmoxer splits it off the host, and the fork's PBS patch does the same. When the proxy
 name changes, the entry needs the new name without being removed and added again, which
 would orphan every entity and its history. These rules are pure, so they are unit-tested

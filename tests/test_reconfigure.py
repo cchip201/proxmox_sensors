@@ -1,5 +1,5 @@
 """The PVE reconfigure step (cmcore fork, 2026-10-22): a node's proxy name changed
-(proxmox.cmcore.net -> proxmox720.cmcore.net) and the entry must follow it without being
+(pve.example.lan -> pve1.example.lan) and the entry must follow it without being
 removed and added again, which would orphan every entity and its history."""
 
 from unittest.mock import patch
@@ -11,15 +11,15 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.proxmox_sensors.api import AuthenticationError, CannotConnect
 from custom_components.proxmox_sensors.const import DOMAIN
 
-OLD = "proxmox.cmcore.net:443"
-NEW = "proxmox720.cmcore.net:443"
+OLD = "pve.example.lan:443"
+NEW = "pve1.example.lan:443"
 DATA = {
     "platform_type": "PVE",
     "host": OLD,
-    "node": "dper720xd",
-    "server_id": "dper720xd",
-    "user": "hmasst@pve",
-    "token_id": "hmasst",
+    "node": "pve1",
+    "server_id": "pve1",
+    "user": "monitor@pve",
+    "token_id": "monitor",
     "token_secret": "not-a-real-secret",
     "verify_ssl": True,
     "auto_detect_node": True,
@@ -55,14 +55,14 @@ class FakeClient:
 @pytest.fixture
 def fake_client():
     FakeClient.made = []
-    FakeClient.answers = {"nodes": [{"node": "dper720xd", "status": "online"}], "cluster/resources": []}
+    FakeClient.answers = {"nodes": [{"node": "pve1", "status": "online"}], "cluster/resources": []}
     with patch("custom_components.proxmox_sensors.config_flow.ProxmoxClient", FakeClient), \
             patch("custom_components.proxmox_sensors.async_setup_entry", return_value=True), \
             patch("custom_components.proxmox_sensors.async_unload_entry", return_value=True):
         yield FakeClient
 
 
-def _entry(hass, data=None, unique_id=None, title="PVE: dper720xd"):
+def _entry(hass, data=None, unique_id=None, title="PVE: pve1"):
     entry = MockConfigEntry(domain=DOMAIN, data=dict(data or DATA), unique_id=unique_id, title=title, version=3)
     entry.add_to_hass(hass)
     return entry
@@ -74,7 +74,7 @@ async def test_the_form_offers_the_current_address(hass, fake_client):
     assert result["type"] is FlowResultType.FORM and result["step_id"] == "reconfigure"
     field = next(k for k in result["data_schema"].schema if str(k) == "host")
     assert field.description == {"suggested_value": OLD}
-    assert result["description_placeholders"] == {"node": "dper720xd"}
+    assert result["description_placeholders"] == {"node": "pve1"}
     assert fake_client.made == []                                   # nothing is called before a submit
 
 
@@ -84,17 +84,17 @@ async def test_only_the_host_changes_and_the_new_address_is_what_was_checked(has
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"host": f"  {NEW} "})
     assert result["type"] is FlowResultType.ABORT and result["reason"] == "reconfigure_successful"
     assert dict(entry.data) == {**DATA, "host": NEW}
-    assert entry.unique_id is None and entry.title == "PVE: dper720xd"
+    assert entry.unique_id is None and entry.title == "PVE: pve1"
     assert [c.host for c in fake_client.made] == [NEW]
-    assert fake_client.made[0].verify_ssl is True and fake_client.made[0].token_id == "hmasst"
+    assert fake_client.made[0].verify_ssl is True and fake_client.made[0].token_id == "monitor"
     assert fake_client.made[0].calls == ["nodes", "cluster/resources", "nodes"]
 
 
 async def test_an_address_that_reaches_another_node_is_refused(hass, fake_client):
     entry = _entry(hass)
-    fake_client.answers["nodes"] = [{"node": "dellprectower"}]
+    fake_client.answers["nodes"] = [{"node": "pve2"}]
     result = await entry.start_reconfigure_flow(hass)
-    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"host": "proxmoxdpt.cmcore.net:443"})
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {"host": "pve2.example.lan:443"})
     assert result["type"] is FlowResultType.FORM and result["errors"] == {"base": "node_not_found"}
     assert dict(entry.data) == DATA
 
@@ -121,8 +121,8 @@ async def test_no_visible_node_is_insufficient_permissions(hass, fake_client):
     assert result["errors"] == {"base": "insufficient_permissions"} and dict(entry.data) == DATA
 
 
-@pytest.mark.parametrize("bad", ["https://proxmox720.cmcore.net", "proxmox720.cmcore.net/api2", "proxmox720.cmcore.net:99999",
-                                 "proxmox720.cmcore.net:", "user@proxmox720.cmcore.net", "two words"])
+@pytest.mark.parametrize("bad", ["https://pve1.example.lan", "pve1.example.lan/api2", "pve1.example.lan:99999",
+                                 "pve1.example.lan:", "user@pve1.example.lan", "two words"])
 async def test_a_malformed_address_is_refused_before_any_call(hass, fake_client, bad):
     entry = _entry(hass)
     result = await entry.start_reconfigure_flow(hass)
@@ -132,15 +132,15 @@ async def test_a_malformed_address_is_refused_before_any_call(hass, fake_client,
 
 
 async def test_a_host_based_unique_id_follows_the_address(hass, fake_client):
-    entry = _entry(hass, unique_id=f"pve:{OLD}:dper720xd")
+    entry = _entry(hass, unique_id=f"pve:{OLD}:pve1")
     result = await entry.start_reconfigure_flow(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"host": NEW})
     assert result["reason"] == "reconfigure_successful"
-    assert entry.unique_id == f"pve:{NEW}:dper720xd" and entry.data["host"] == NEW
+    assert entry.unique_id == f"pve:{NEW}:pve1" and entry.data["host"] == NEW
 
 
 async def test_an_address_another_entry_already_watches_aborts(hass, fake_client):
-    _entry(hass, data={**DATA, "host": NEW}, title="PVE: dper720xd (2)")
+    _entry(hass, data={**DATA, "host": NEW}, title="PVE: pve1 (2)")
     entry = _entry(hass)
     result = await entry.start_reconfigure_flow(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"host": NEW})
@@ -149,8 +149,8 @@ async def test_an_address_another_entry_already_watches_aborts(hass, fake_client
 
 
 async def test_a_pbs_entry_is_not_reconfigured_here(hass, fake_client):
-    entry = _entry(hass, data={"platform_type": "PBS", "host": "pbs.cmcore.net:443", "node": "Proxmox",
-                               "server_id": "pbs_1", "user": "hmasst@pbs", "token_id": "t", "token_secret": "s"},
+    entry = _entry(hass, data={"platform_type": "PBS", "host": "pbs.example.lan:443", "node": "Proxmox",
+                               "server_id": "pbs_1", "user": "monitor@pbs", "token_id": "t", "token_secret": "s"},
                    title="PBS: Proxmox")
     result = await entry.start_reconfigure_flow(hass)
     assert result["type"] is FlowResultType.ABORT and result["reason"] == "reconfigure_not_supported"

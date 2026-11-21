@@ -156,7 +156,7 @@ def _config_host_error(value, platform) -> str | None:
 def _reconfigure_host_error(value, platform) -> str | None:
     """A new address for an EXISTING entry: the rules of a new entry's host, plus an
     optional ``:port`` after it - the form every PVE entry made before the 5.2.0 host
-    validation already carries (``proxmox.cmcore.net:443`` behind a reverse proxy)."""
+    validation already carries (``pve.example.lan:443`` behind a reverse proxy)."""
     parts = split_host_port(value)
     if parts is None:
         return "invalid_host_port"

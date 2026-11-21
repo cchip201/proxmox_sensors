@@ -200,7 +200,7 @@ def can_remove_pve_device(hass, entry, device):
         built = list(local.values())
         if any(not isinstance(resource, dict) for resource in resources + built):
             return False
-        # A guest the entry no longer selects may keep its VMID on the node (the 720
+        # A guest the entry no longer selects may keep its VMID on the node (the replica node
         # keeps stopped replicas of guests that moved): only a guest this entry still
         # builds keeps its device then. A selected guest keeps the full check.
         selection = get_entry_guest_selection(
